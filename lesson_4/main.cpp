@@ -13,164 +13,46 @@
 #include "../Utils/Math.hpp"
 #include "../Utils/BufferUtils.hpp"
 
-template<typename DType, std::uint32_t Cols, std::uint32_t RowTile, std::uint32_t RowStride, std::uint32_t LdsPad>
-__device__ void globalRead(volatile DType localBuf[][Cols + LdsPad], 
-                           DType *tVal,
-                           const DType *a,
-                           std::uint32_t row,
-                           std::uint32_t col,
-                           std::uint32_t rowShift,
-                           std::uint32_t ldsPad) {
-    static_assert(Cols % RowTile == 0, "Cols % RowTile must be 0");
-
-    // if constexpr (RowTile == 1) {
-        #pragma unroll
-        for (std::uint32_t j = 0; j < RowTile; ++j) {
-            const auto procRow = row + RowStride * j;
-            const auto readOffset = blockIdx.x * blockDim.x * RowTile + procRow * Cols - rowShift * Cols + col;
-            tVal[j] = a[readOffset];
-            localBuf[procRow][col + ldsPad] = tVal[j];
-        }
-    // } else if constexpr (RowTile == 2) {
-    //     constexpr auto numRowComp = Cols / RowTile;
-    //     row = threadIdx.x / numRowComp;
-    //     col = (threadIdx.x % numRowComp) * RowTile;
-    //     const auto readOffset = blockIdx.x * blockDim.x * RowTile + row * Cols - rowShift * Cols + col;
-    //     float2 tVals = make_float2(a[readOffset + 0], a[readOffset + 1]);
-    //     tVal[0] = tVals.x;
-    //     tVal[1] = tVals.y;
-    //     float2 *localBufPtr = (float2 *)(&localBuf[row][ldsPad]);
-    //     *localBufPtr = tVals;
-    // } else {
-    //     constexpr auto numRowComp = Cols / RowTile;
-    //     row = threadIdx.x / numRowComp;
-    //     col = (threadIdx.x % numRowComp) * RowTile;
-    //     const auto readOffset = blockIdx.x * blockDim.x * RowTile + row * Cols - rowShift * Cols + col;
-    //     #pragma unroll
-    //     for (std::uint32_t j = 0; j < RowTile; ++j) {
-    //         tVal[j] = a[readOffset + j];
-    //     }
-
-    //     #pragma unroll
-    //     for (std::uint32_t j = 0; j < RowTile; ++j) {
-    //         localBuf[row][col + j] = tVal[j];
-    //     }
-    // }
-}
-
-template<typename DType, std::uint32_t Cols, std::uint32_t RowTile, std::uint32_t WorkgroupSize>
-__global__ void hipGpuSoftmaxKernel(DType *m, const DType *a, std::uint32_t numRows) {
-    static_assert((Cols & (Cols - 1)) == 0, "Cols must be power of 2");
-    constexpr uint32_t numRowsPerIter = WorkgroupSize / Cols;
-    constexpr uint32_t numRowsInBlock = RowTile * numRowsPerIter;
-    constexpr uint32_t prepad = 0;
-    __shared__ DType localBuf[numRowsInBlock][Cols + prepad];
-    const uint32_t tId = threadIdx.x;
-    const auto lastRowIdx = numRowsInBlock * (blockIdx.x + 1);
-    const auto globalReadRowShift = (lastRowIdx <= numRows) ? 0 : (lastRowIdx - numRows);
-    const auto row = tId / Cols;
-    const auto col = tId & (Cols - 1);
-    const uint32_t ldsPad = 0;//row % prepad;
-    const uint32_t paddedCol = col + ldsPad;
-    DType tVal[RowTile];
-    globalRead<DType, Cols, RowTile, numRowsPerIter, prepad>(localBuf, tVal, a, row, col, globalReadRowShift, ldsPad);
-    __syncthreads();
-
-    #pragma unroll
-    for (std::uint32_t s = (Cols >> 1); s > 0; s >>= 1) {
-        if (col < s) {
-            #pragma unroll
-            for (std::uint32_t j = 0; j < RowTile; ++j) {
-                const auto procRow = row + j * numRowsPerIter;
-                localBuf[procRow][paddedCol] = std::max(localBuf[procRow][paddedCol], localBuf[procRow][paddedCol + s]);
-            }
-        }
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (std::uint32_t j = 0; j < RowTile; ++j) {
-        const auto procRow = row + j * numRowsPerIter;
-        const DType rowMax = localBuf[procRow][ldsPad];
-        tVal[j] -= rowMax;
-        tVal[j] = expf(tVal[j]);
-        localBuf[procRow][paddedCol] = tVal[j];
-    }
-    __syncthreads();
-
-    #pragma unroll
-    for (std::uint32_t s = (Cols >> 1); s > 0; s >>= 1) {
-        if (col < s) {
-            #pragma unroll
-            for (std::uint32_t j = 0; j < RowTile; ++j) {
-                const auto procRow = row + j * numRowsPerIter;
-                localBuf[procRow][paddedCol] += localBuf[procRow][paddedCol + s];
-            }
-        }
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (std::uint32_t j = 0; j < RowTile; ++j) {
-        const auto procRow = row + j * numRowsPerIter;
-        const auto writeOffset = blockIdx.x * blockDim.x * RowTile + procRow * Cols - globalReadRowShift * Cols + col;
-        if (procRow >= globalReadRowShift) {
-            const DType rowSum = localBuf[procRow][ldsPad];
-            m[writeOffset] = tVal[j] / rowSum;
-        }
-    }
-}
-
-template<typename DType, std::uint32_t Cols, std::uint32_t RowTile, std::size_t WorkgroupSize>
-void hipGpuSoftmax(DType *m, DType *a, std::uint32_t numRows) {
-    std::uint32_t numElements = numRows * Cols;
-    const std::uint32_t numWorkgroups = std::ceil(numElements / static_cast<float>(RowTile) / WorkgroupSize);
-    //std::cout << numWorkgroups << " workgroups will be used\n";
-    hipGpuSoftmaxKernel<DType, Cols, RowTile, WorkgroupSize><<<numWorkgroups, WorkgroupSize>>>(m, a, numRows);
-    return;
-}
 
 template<typename DType>
-void cpuSoftmax(DType *m, DType *a, std::uint32_t numRows, std::uint32_t numCols) {
-    for (std::uint32_t i = 0; i < numRows; ++i) {
-        const auto rowMax = *std::max_element(a + i * numCols, a + i * numCols + numCols);
-        auto rowSum = 0.f;
-        std::transform(a + i * numCols, a + i * numCols + numCols, m + i * numCols, [&rowSum, rowMax] (auto v) {
-            const auto u = std::exp(v - rowMax);
-            rowSum += u;
-            return u;
-        });
+void cpuLayerNorm(DType *out, DType *in, std::uint32_t batch, std::uint32_t length, DType eps=1e-05)
+{
+    std::vector<DType> mean(batch, 0);
+    std::vector<DType> var(batch, 0);
 
-        std::transform(m + i * numCols, m + i * numCols + numCols, m + i * numCols, [rowSum] (auto v) {
-            return v / rowSum;
-        });
-    }
-}
+    // calculate mean
+    for(int i=0; i<batch; i++)
+    {
+        DType* inC  = in  + i * length;
+        DType* outC = out + i * length;
 
-template<typename DType, std::uint32_t Cols, std::uint32_t RowTile>
-void luanchGPUKernel(DType *dst, DType *src, std::uint32_t nRows) {
-    //static_assert(Cols == 16, "Should not reach here");
-    if constexpr (Cols == 16) {
-        if (nRows == 1) {
-            hipGpuSoftmax<DType, Cols, RowTile, Cols>(dst, src, nRows);
-        } else if (nRows == 16) {
-            hipGpuSoftmax<DType, Cols, RowTile, 256>(dst, src, nRows);
-        } else if(nRows >= 1024) {
-            hipGpuSoftmax<DType, Cols, RowTile, 1024>(dst, src, nRows);
+        for(int j=0; j<length; j++)
+        {
+            mean[i] += inC[j];
+        }
+        mean[i] = mean[i] / length;
+
+        // calculate var
+        for(int j=0; j<length; j++)
+        {
+            var[i] += (inC[j] - mean[i]) * (inC[j] - mean[i]);
+        }
+        var[i] = std::sqrt(var[i] / length + eps);
+
+        // calculate var
+        for(int j=0; j<length; j++) {
+            outC[j] = (inC[j] - mean[i]) / var[i];
         }
     }
 }
 
-std::uint32_t getNumWorkgroups(std::size_t m, std::size_t n, std::size_t tileM, std::size_t tileN) {
-    return ((m / tileM) + !!(m % tileM));
-}
-
-hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uint32_t m, std::uint32_t n, std::size_t numRuns, bool sync = true) {
+hipError_t launchASMLayerNorm(hipFunction_t func, float *src, float *dst, std::uint32_t m, std::uint32_t n, float eps, std::size_t numRuns, bool sync = true) {
     KernelArguments args;
     args.append(src);
     args.append(dst);
     args.append(m);
     args.append(n);
+    args.append(eps);
     args.applyAlignment();
     std::size_t argsSize = args.size();
     void *launchArgs[] = {
@@ -186,10 +68,10 @@ hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uin
     err = hipEventCreate(&end);
 
     err = hipEventRecord(beg);
-    const auto numWorkgroups = getNumWorkgroups(m, n, 1, 256);
+    const auto numWorkgroups = m;
 
     for (size_t i = 0; i < numRuns; ++i) {
-        err = hipExtModuleLaunchKernel(func, numWorkgroups * 256, 1, 1, 256, 1, 1, 256 * sizeof(float), nullptr, nullptr, launchArgs);
+        err = hipExtModuleLaunchKernel(func, 256, numWorkgroups, 1, 256, 1, 1, 32 * sizeof(float), nullptr, nullptr, launchArgs);
     }
 
     err = hipEventRecord(end);
@@ -208,96 +90,101 @@ hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uin
 
 hipError_t prepareASMKernel(const std::string &funcName, const std::string &coPath, hipModule_t *module, hipFunction_t *func) {
     auto err = hipModuleLoad(module, coPath.c_str());
+    if (err != hipSuccess)
+        std::cout << "hipModuleLoad failed" << std::endl;
     err = hipModuleGetFunction(func, *module, funcName.c_str());
+    if (err != hipSuccess)
+        std::cout << "hipModuleGetFunction failed" << std::endl;
     return err;
+}
+
+template <typename T>
+void dumpBuffer(const char* title, const std::vector<T>& data, int m, int n)
+
+{
+    std::cout << std::endl <<  "----- " << title << " -----" << std::endl;
+    for(int i=0; i<m; i++)
+    {
+        for(int j=0; j<n; j++)
+        {
+            std::cout << data[j+i*n] << " ";
+            if (j%64 == 63)
+                std::cout << std::endl;
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
 }
 
 int main(int argc, char **argv) {
     hipDevice_t dev{};
     auto err = hipDeviceGet(&dev, 0);
     assert(argc == 4);
+
     const std::string coPath(argv[1]);
     const std::uint32_t m(std::atoi(argv[2]));
     const std::uint32_t n(std::atoi(argv[3]));
     const std::uint32_t numElements = m * n;
-    float *gpuMem{};
+
     std::vector<float> cpuMem(numElements, 0);
     randomize(begin(cpuMem), end(cpuMem));
-    // std::iota(begin(cpuMem), end(cpuMem), 0.f);
+
+    float *gpuMem{};
     err = hipMalloc(&gpuMem, sizeof(float) * numElements);
     err = hipMemcpyHtoD(gpuMem, cpuMem.data(), cpuMem.size() * sizeof(float));
+
     float *hipResult{};
     err = hipMalloc(&hipResult, sizeof(float) * numElements);
     err = hipMemset(hipResult, 0, sizeof(float) * numElements);
+    std::cout << "hipResult address: " << hipResult << std::endl;
+
     hipModule_t module{};
     hipFunction_t func{};
-    err = prepareASMKernel("Softmax_DT_S_MT_1_256", coPath, &module, &func);
-    err = launchASMSoftmax(func, gpuMem, hipResult, m, n, 50);
-    std::vector<float> asmResult(numElements, 0.f);
+    err = prepareASMKernel("LayerNorm", coPath, &module, &func);
+    if (err)
+        std::cout << "find asm kernel failed" << std::endl;
+    err = launchASMLayerNorm(func, gpuMem, hipResult, m, n, 1e-05, 2000);
+    if (err)
+        std::cout << "launchASMLayerNorm error : " << err << std::endl;
+
+    std::vector<float> asmResult(numElements, 0.0f);
     err = hipMemcpyDtoH(asmResult.data(), hipResult, numElements * sizeof(float));
+    // dumpBuffer("GPU result", asmResult, m, n);
+
     std::vector<float> cpuRef(numElements, 0.f);
-    cpuSoftmax<float>(cpuRef.data(), cpuMem.data(), m, n);
+    cpuLayerNorm<float>(cpuRef.data(), cpuMem.data(), m, n, 1e-05);
+    // dumpBuffer("CPU result", cpuRef, m, n);
 
+    float error = 0.0;
+    int gpunan = 0;
+    int cpunan = 0;
+    int gpuinf = 0;
+    int cpuinf = 0;
     for (std::size_t i = 0; i < numElements; ++i) {
-        if (!almostEqual(asmResult[i], cpuRef[i])) {
-            std::cout << "ASM kernel vs CPU mismatched!!\n";
-            std::cout << "Idx: " << i << '\n';
-            std::cout << asmResult[i] << " vs " << cpuRef[i] << '\n';
-            std::cout << "Diff: " << std::abs(asmResult[i] - cpuRef[i]) << '\n';
-            return EXIT_FAILURE;
+        error = std::max(error, std::abs(asmResult[i]-cpuRef[i]));
+        if (std::isnan(asmResult[i])) {
+            gpunan += 1;
+        }
+        if (std::isnan(cpuRef[i])) {
+            cpunan += 1;
+        }
+        if (std::isinf(asmResult[i])) {
+            gpuinf += 1;
+        }
+        if (std::isinf(cpuRef[i])) {
+            cpuinf += 1;
         }
     }
+    if (gpunan)
+        std::cout << "gpunan: " << gpunan << std::endl;
+    if (cpunan)
+        std::cout << "cpunan: " << cpunan << std::endl;
+    if (gpuinf)
+        std::cout << "gpuinf: " << gpuinf << std::endl;
+    if (cpuinf)
+        std::cout << "cpuinf: " << cpuinf << std::endl;
 
-    hipEvent_t beg, end;
-    err = hipEventCreate(&beg);
-    err = hipEventCreate(&end);
-
-    // err = hipEventRecord(beg);
-
-    constexpr std::size_t numWarmups = 50;
-    constexpr std::size_t rowTile = 1;
-
-    // for (std::size_t i = 0; i < numWarmups; ++i) {
-    //     luanchGPUKernel<float, n, rowTile>(hipResult, gpuMem, m);
-    // }
-
-    const std::size_t numRuns = 30;
-    // for (std::size_t i = 0; i < numRuns; ++i) {
-    //     luanchGPUKernel<float, n, rowTile>(hipResult, gpuMem, m);
-    // }
-    // err = hipEventRecord(end);
-    // err = hipDeviceSynchronize();
-    // float hipDur{};
-    // err = hipEventElapsedTime(&hipDur, beg, end);
-    // std::cout << "HIP Softmax func: " << std::to_string(hipDur / numRuns) << " ms ~= " << 2 * numRuns * numElements * sizeof(float) * 1e3 / std::pow(1024.f, 3) / hipDur << " GB/s\n";
-
-    auto cpuBeg = std::chrono::steady_clock::now();
-    std::vector<float> cpuOut(numElements);
-    for (std::size_t i = 0; i < numRuns; ++i) {
-        cpuSoftmax<float>(cpuOut.data(), cpuMem.data(), m, n);
-    }
-    auto cpuEnd = std::chrono::steady_clock::now();
-    std::cout << "CPU Softmax func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() / numRuns << " ms\n";
-    std::vector<float> hipReturnedResult(numElements);
-    err = hipMemcpyDtoH(hipReturnedResult.data(), hipResult, sizeof(float) * numElements);
-    std::size_t numMismatched{};
-    float maxDiff = 0;
-
-    for (size_t i = 0; i < numElements; ++i) {
-        if (!almostEqual(hipResult[i], cpuOut[i])) {
-            maxDiff = std::max(maxDiff, std::abs(hipReturnedResult[i] - cpuOut[i]));
-            // std::cout << "Check HIP vs CPU failed at: " << i
-            //     << ", " << std::to_string(hipReturnedResult[i])
-            //     << " : " << std::to_string(cpuOut[i])
-            //     << ", diff: "
-            //     << std::to_string(std::abs(hipReturnedResult[i] - cpuOut[i]))
-            //     << '\n';
-            ++numMismatched;
-        }
-    }
-
-    std::cout << "Mismatched: " << numMismatched << '\n';
-    std::cout << "Max diff: " << maxDiff << '\n';
+    std::cout << "Tony max error : " << error << std::endl;
 
     err = hipFree(gpuMem);
     err = hipModuleUnload(module);

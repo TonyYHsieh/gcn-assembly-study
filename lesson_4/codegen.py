@@ -29,29 +29,42 @@ import os
 import yaml
 import json
 import subprocess
+import collections
 from contextlib import contextmanager
 import Tensile.TensileInstructions as ti
 from Tensile.Common import detectGlobalCurrentISA, restoreDefaultGlobalParameters, \
     assignGlobalParameters, getGfxName, gfxArch, globalParameters
 
-def record_num_calls(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not hasattr(wrapper, '__num_calls__'):
-            wrapper.__num_calls__ = 0
-            wrapper.num_calls = lambda: wrapper.__num_calls__
-        wrapper.__num_calls__ += 1
-        return f(*args, **kwargs)
+def kernel_header(name: str, gfx_arch: str, vgpr: int, sgpr: int, lds: int):
+    vgpr = ((vgpr+7)//8)*8
+    sgpr = ((sgpr+7)//8)*8
+    lds  = ((lds+31)//32)*32
 
-    return wrapper
-
-def kernel_header(name: str, gfx_arch: str):
-    return f'''.amdgcn_target "amdgcn-amd-amdhsa--{gfx_arch}"
+    return f'''
+.amdgcn_target "amdgcn-amd-amdhsa--{gfx_arch}"
 .text
-.global {name}
+.protected {name}
+.globl {name}
 .p2align 8
 .type {name},@function
-            '''
+.section .rodata,#alloc
+.p2align 6
+.amdhsa_kernel {name}
+  .amdhsa_user_sgpr_kernarg_segment_ptr 1
+  .amdhsa_accum_offset {vgpr} // accvgpr offset
+  .amdhsa_next_free_vgpr {vgpr} // vgprs
+  .amdhsa_next_free_sgpr {sgpr} // sgprs
+  .amdhsa_group_segment_fixed_size {lds} // lds bytes
+  .amdhsa_private_segment_fixed_size 0
+  .amdhsa_system_sgpr_workgroup_id_x 1
+  .amdhsa_system_sgpr_workgroup_id_y 1
+  .amdhsa_system_sgpr_workgroup_id_z 1
+  .amdhsa_system_vgpr_workitem_id 0
+  .amdhsa_float_denorm_mode_32 3
+  .amdhsa_float_denorm_mode_16_64 3
+.end_amdhsa_kernel
+.text
+'''
 
 @contextmanager
 def asm_func(func_name: str, module: ti.Module):
@@ -60,33 +73,28 @@ def asm_func(func_name: str, module: ti.Module):
         yield
     finally:
         end_label_name = f'.L{func_name}_end'
+        module.add(ti.SEndpgm())
         module.add(ti.TextBlock(f'{end_label_name}:\n'))
         module.add(ti.TextBlock(f'.size {func_name}, {end_label_name} - {func_name}\n'))
 
 @contextmanager
-def auto_exec_scope(sgpr_pool: ti.RegisterPool, module: ti.Module):
+def asm_loop(mod: ti.Module, name: str, it: str):
     try:
-        tmp_exec_reg_idx = sgpr_pool.checkOutAligned(2, 2)
-        module.add(ti.SMovB64(ti.sgpr(tmp_exec_reg_idx, 2), ti.EXEC()))
-        yield
-    finally:
-        module.add(ti.SMovB64(ti.EXEC(), ti.sgpr(tmp_exec_reg_idx, 2)))
-        sgpr_pool.checkIn(tmp_exec_reg_idx)
-
-@contextmanager
-def asm_loop(sgpr_pool: ti.RegisterPool, module: ti.Module, name: str):
-    try:
-        reg = sgpr_pool.checkOut(1)
         loop_start_label = ti.Label(name, f'loop {name} starts') 
         loop_end_label = ti.Label(f'{name}_end', f'loop {name} ends')
-        module.add(ti.SMovB32(ti.sgpr(reg, 1), 0, 'init loop counter'))
-        module.add(loop_start_label)
-        yield ti.RegisterPoolResource(reg, 1), loop_start_label, loop_end_label
+        mod.add(loop_start_label)
+        mod.add(ti.SCmpEQU32(ti.sgpr(it), 0))
+        mod.add(ti.SCBranchSCC1(loop_end_label.getLabelName()))
+        mod.addSpaceLine()
+        yield
     finally:
-        module.add(loop_end_label)
-        sgpr_pool.checkIn(reg)
+        mod.add(ti.SSubU32(ti.sgpr(it), ti.sgpr(it), 1))
+        mod.add(ti.SBranch(loop_start_label.getLabelName()))
+        mod.add(loop_end_label)
+        mod.addSpaceLine()
 
-class SoftmaxKernelGenerator:
+
+class LayerNormKernelGenerator:
     srd_num_reg = 4
     srd_alignment = 4
 
@@ -97,47 +105,30 @@ class SoftmaxKernelGenerator:
                  num_workitems: int,
                  arch: str):
         self.io_type = io_type
-        self.num_cols = num_cols
-        self.num_rows = num_rows
         self.num_workitems = num_workitems
-        self.sgpr_pool = ti.RegisterPool(20, 's', True)
-        self.vgpr_pool = ti.RegisterPool(10, 'v', True)
-        self.sgpr_pool.addRange(3, 19) #TODO: estimate this
-        self.vgpr_pool.addRange(1, 9) #TODO: estimate this
-        self.t_id_reg_idx = 0 #TODO: support config on this
-        self.wg_id_reg_idx = 2 #TODO: support config on this
-        self.numerically_stable = True
+        self.sgpr_pool = ti.RegisterPool(24, 's', True)
+        self.vgpr_pool = ti.RegisterPool(40, 'v', True)
+        self.sgpr_pool.add(0, 23) #TODO: estimate this
+        self.vgpr_pool.add(0, 39) #TODO: estimate this
         self.debug_label = True
         self.arch = arch
-        self.op = 'Softmax'
-
-    @property
-    def num_external_iters(self) -> int:
-        return (self.num_cols * self.num_rows) // self.num_workitems
-
-    @property
-    def num_rows_processed_per_iter(self) -> int:
-        return self.num_workitems // self.num_cols
-
-    def _validate(self):
-        assert (self.num_cols * self.num_rows) % self.num_workitems == 0
+        self.op = 'LayerNorm'
+        self.sgprs  = collections.OrderedDict()
+        self.vgprs  = collections.OrderedDict()
 
     @property
     def lds_usage_byte(self) -> int:
-        return self.num_cols * self.num_rows_processed_per_iter * self.io_type.numBytes()
+        return 32
 
     @property
     def func_name(self):
-        return f'Softmax_DT_{self.io_type}_MT_{self.num_rows}_{self.num_cols}'
+        return f'LayerNorm'
 
     def dumps(self, format: str) -> str:
         param_dict = {
             'io_type': self.io_type.toChar(),
-            'num_cols': self.num_cols,
-            'num_rows': self.num_rows,
             'num_workitems': self.num_workitems,
             'func_name': self.func_name,
-            'numerically_stable': self.numerically_stable,
             'debug_label': self.debug_label,
             'arch': self.arch,
             'op': self.op
@@ -155,497 +146,398 @@ class SoftmaxKernelGenerator:
         with open(output_path, 'w') as f:
             f.write(s)
 
-    def loads(self, format: str, data: str):
-        if format.lower() == 'yaml':
-            param_dict = yaml.load(data, yaml.SafeLoader)
-        elif format.lower() == 'json':
-            param_dict = json.loads(data)
-        else:
-            assert False, f'Unsupported format: {format}'
+    def defineSgpr(self, name, numSgprs, align=1):
+        if numSgprs == 0: return
+        sgprIdx = self.sgpr_pool.checkOutAligned(numSgprs, align, tag=name, preventOverflow=0)
+        self.sgprs[name] = sgprIdx
+        return sgprIdx
+
+    def defineVgpr(self, name, numVgprs, align=1):
+        if numVgprs == 0: return
+        vgprIdx = self.vgpr_pool.checkOutAligned(numVgprs, align, tag=name, preventOverflow=0)
+        self.vgprs[name] = vgprIdx
+        return vgprIdx
 
-        self.io_type = ti.DataType(param_dict['io_type'])
-        self.num_cols = param_dict['num_cols']
-        self.num_rows = param_dict['num_rows']
-        self.num_workitems = param_dict['num_workitems']
-        self.func_name = param_dict['func_name']
-        self.numerically_stable = param_dict['numerically_stable']
-        self.debug_label = param_dict['debug_label']
-        self.arch = param_dict['arch']
-        self.op = param_dict['op']
-
-    def local_write_inst_type(self, num_elements: int):
-        if self.io_type.isSingle():
-            insts = {
-                1: ti.DSStoreB32,
-                2: ti.DSStoreB64,
-                4: ti.DSStoreB128
-            }
-
-        return insts[num_elements]
-
-    def global_read_inst_type(self, num_elements: int) -> Union[ti.BufferLoadB32, ti.BufferLoadB64, ti.BufferLoadB128]:
-        if self.io_type.isSingle():
-            insts = {
-                1: ti.BufferLoadB32,
-                2: ti.BufferLoadB64,
-                4: ti.BufferLoadB128
-            }
-        elif self.io_type.isHalf():
-            insts = {
-                2: ti.BufferLoadB32,
-                4: ti.BufferLoadB64,
-                8: ti.BufferLoadB128
-            }
-        else:
-            raise NotImplementedError
-        return insts[num_elements]
-
-    def global_write_inst_type(self, num_elements: int):
-        if self.io_type.isSingle():
-            insts = {
-                1: ti.BufferStoreB32,
-                2: ti.BufferStoreB64,
-                4: ti.BufferStoreB128
-            }
-        elif self.io_type.isHalf():
-            insts = {
-                2: ti.BufferStoreB32,
-                4: ti.BufferStoreB64,
-                8: ti.BufferStoreB128
-            }
-        else:
-            raise NotImplementedError
-        return insts[num_elements]
-
-    @property
-    def srd_const(self) -> str:
-        if self.io_type.isSingle():
-            return hex(0x20000)
-
-        raise NotImplementedError
-
-    @property
-    def bpe(self) -> int:
-        return self.io_type.numBytes()
-
-    def load_kernel_args(self):
-        kernel_args_addr = 0
-        kernel_args_addr_size = 2
-        input_srd_idx = self.sgpr_pool.checkOutAligned(self.srd_num_reg, self.srd_alignment)
-        output_srd_idx = self.sgpr_pool.checkOutAligned(self.srd_num_reg, self.srd_alignment)
-        m_reg_idx = self.sgpr_pool.checkOut(1)
-        n_reg_idx = self.sgpr_pool.checkOut(1)
-        num_elem_reg_idx = self.sgpr_pool.checkOut(1)
-        module = ti.Module('Load kernel args')
-        module.add(ti.SLoadB64(ti.sgpr(input_srd_idx, 2), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 0))
-        module.add(ti.SLoadB32(ti.sgpr(m_reg_idx), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 16))
-        module.add(ti.SLoadB32(ti.sgpr(n_reg_idx), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 20))
-        module.add(ti.SWaitCnt(lgkmcnt=0))
-        module.add(ti.SLoadB64(ti.sgpr(output_srd_idx, 2), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 8))
-        module.add(ti.SMulI32(ti.sgpr(num_elem_reg_idx), ti.sgpr(m_reg_idx), ti.sgpr(n_reg_idx)))
-        module.add(ti.SMulI32(ti.sgpr(num_elem_reg_idx), ti.sgpr(num_elem_reg_idx), hex(self.bpe)))
-        module.add(ti.SMovB32(ti.sgpr(input_srd_idx + 2), ti.sgpr(num_elem_reg_idx)))
-        module.add(ti.SWaitCnt(lgkmcnt=0))
-        module.add(ti.SMovB32(ti.sgpr(output_srd_idx + 2), ti.sgpr(num_elem_reg_idx)))
-        module.add(ti.SMovB32(ti.sgpr(input_srd_idx + 3), self.srd_const))
-        module.add(ti.SMovB32(ti.sgpr(output_srd_idx + 3), self.srd_const))
-        self.sgpr_pool.checkIn(num_elem_reg_idx)
-        return module, input_srd_idx, output_srd_idx, m_reg_idx, n_reg_idx
-
-    def local_offset(self, stride_reg_idx: Optional[int]) -> Tuple[ti.Module, int]:
-        module = ti.Module()
-        t_id_reg_idx = self.t_id_reg_idx
-        tmp_reg_idx = self.vgpr_pool.checkOut(2)
-        col_idx_reg_idx = tmp_reg_idx
-        row_idx_reg_idx = tmp_reg_idx + 1
-        byte_offset_reg_idx = self.vgpr_pool.checkOut(1)
-        module.add(ti.vectorStaticDivideAndRemainder(row_idx_reg_idx, col_idx_reg_idx, t_id_reg_idx, self.num_cols, None))
-
-        if not stride_reg_idx:
-            module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(row_idx_reg_idx), self.num_cols, None))
-        else:
-            module.add(ti.VMulLOU32(ti.vgpr(byte_offset_reg_idx), ti.vgpr(row_idx_reg_idx), ti.sgpr(stride_reg_idx)))
-
-        module.add(ti.VAddU32(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), ti.vgpr(col_idx_reg_idx)))
-        module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.bpe, None))
-        self.vgpr_pool.checkIn(tmp_reg_idx)
-        return module, byte_offset_reg_idx
-
-    @record_num_calls
-    def global_read(self, srd_reg_idx: Union[int, str],
-                    soffset_reg_idx: int,
-                    n_reg_idx: int, sync: bool):
-        '''
-        col_idx = t_id % num_cols
-        row_idx = t_id / num_cols
-        byte_offset = row_idx * num_cols + col_idx
-        byte_offset *= bpe
-        data = global_read(src, byte_offset)
-        '''
-        module = ti.Module('global read')
-
-        if self.debug_label:
-            module.add(ti.Label(f'global_read_{self.global_read.num_calls()}', 'global read begins'))
-
-        local_offset_mod, byte_offset_reg_idx = self.local_offset(n_reg_idx)
-        module.add(local_offset_mod)
-
-        num_elem_read = 1
-        BufferLoadType = self.global_read_inst_type(num_elem_read)
-        data_reg_idx = self.vgpr_pool.checkOut(1)
-        module.add(BufferLoadType(ti.vgpr(data_reg_idx), ti.vgpr(byte_offset_reg_idx), ti.sgpr(srd_reg_idx, self.srd_num_reg), ti.sgpr(soffset_reg_idx), ti.MUBUFModifiers(offen=True)))
-        self.vgpr_pool.checkIn(byte_offset_reg_idx)
-
-        if sync:
-            module.add(ti.SWaitCnt(vmcnt=0))
-
-        return module, data_reg_idx
-        
-    def local_read(self, ext_local_byte_offset_reg_idx: Optional[int] = None, sync: bool = True):
-        module = ti.Module()
-
-        if not ext_local_byte_offset_reg_idx:
-            local_offset_mod, local_byte_offset_reg_idx = self.local_offset()
-            module.add(local_offset_mod)
-        else:
-            local_byte_offset_reg_idx = ext_local_byte_offset_reg_idx
-
-        data_reg_idx = self.vgpr_pool.checkOut(1)
-        module.add(ti.DSLoadB32(ti.vgpr(data_reg_idx), ti.vgpr(local_byte_offset_reg_idx), False))
-
-        if sync:
-            module.add(ti.SWaitCnt(lgkmcnt=0))
-
-        if not ext_local_byte_offset_reg_idx:
-            self.vgpr_pool.checkIn(local_byte_offset_reg_idx)
-
-        return module, data_reg_idx
-
-    def setup_global_read_wg_offset(self, stride0_reg_idx: int) -> Tuple[ti.Module, int]:
-        '''
-        wg_id = 2
-        num_row_proc = num_workitems / num_cols
-        byte_offset = num_row_proc * ld
-        byte_offset *= bpe
-        '''
-        mod = ti.Module()
-
-        if self.debug_label:
-            mod.add(ti.Label('setup_global_read_wg_offset', 'setup global read wg offset begins'))
-
-        wg_id_reg_idx = self.wg_id_reg_idx
-        wg_byte_offset_reg_idx = self.sgpr_pool.checkOut(1)
-        byte_offset = self.num_rows * self.bpe
-        mod.add(ti.SMulI32(ti.sgpr(wg_byte_offset_reg_idx), ti.sgpr(wg_id_reg_idx), hex(byte_offset)))
-        mod.add(ti.SMulI32(ti.sgpr(wg_byte_offset_reg_idx), ti.sgpr(wg_byte_offset_reg_idx), ti.sgpr(stride0_reg_idx)))
-        return mod, wg_byte_offset_reg_idx
-
-    @record_num_calls
-    def local_write(self, data_reg_idx: int, num_elem: int, ext_local_read_byte_offset_reg_idx: Optional[int], sync: bool):
-        module = ti.Module()
-
-        if self.debug_label:
-            module.add(ti.Label(f'local_write_{self.local_write.num_calls()}', 'local write begins'))
-
-        if not ext_local_read_byte_offset_reg_idx:
-            local_offset_mod, byte_offset_reg_idx = self.local_offset()
-            module.add(local_offset_mod)
-        else:
-            byte_offset_reg_idx = ext_local_read_byte_offset_reg_idx
-
-        LocalWriteType = self.local_write_inst_type(num_elem)
-        module.add(LocalWriteType(ti.vgpr(byte_offset_reg_idx), ti.vgpr(data_reg_idx)))
-
-        if not ext_local_read_byte_offset_reg_idx:
-            self.vgpr_pool.checkIn(byte_offset_reg_idx)
-
-        if sync:
-            module.add(ti.SWaitCnt(lgkmcnt=0))
-            module.add(ti.SBarrier())
-
-        return module
-
-    def lds_max(self, lds_addr0: int, lds_addr1: int, sync: bool = True) -> ti.Module:
-        '''
-        lds[lds_addr0] = max(lds[lds_addr0], lds[lds_addr1])
-        '''
-        module = ti.Module()
-        data_reg_idx_0 = self.vgpr_pool.checkOut(2)
-        data_reg_idx_1 = data_reg_idx_0 + 1
-        max_reg_idx = data_reg_idx_0
-        module.add(ti.DSLoadB32(ti.vgpr(data_reg_idx_0), ti.vgpr(lds_addr0), False))
-        module.add(ti.DSLoadB32(ti.vgpr(data_reg_idx_1), ti.vgpr(lds_addr1), False))
-        module.add(ti.SWaitCnt(lgkmcnt=0))
-        module.add(ti.VMaxF32(ti.vgpr(max_reg_idx), ti.vgpr(data_reg_idx_0), ti.vgpr(data_reg_idx_1)))
-        module.add(ti.DSStoreB32(ti.vgpr(lds_addr0), ti.vgpr(max_reg_idx)))
-
-        if sync:
-            module.add(ti.SWaitCnt(lgkmcnt=0))
-            module.add(ti.SBarrier())
-
-        self.vgpr_pool.checkIn(data_reg_idx_0)
-        return module
-
-    @record_num_calls
-    def max_elem(self) -> Tuple[ti.Module, int]:
-        mod = ti.Module()
-
-        if self.debug_label:
-            mod.add(ti.Label(f'get_row_head_{self.max_elem.num_calls()}', 'get row head begins'))
-
-        t_id_reg_idx = self.t_id_reg_idx
-        addr_reg_idx = self.vgpr_pool.checkOut(1)
-        mod.add(ti.vectorStaticDivide(addr_reg_idx, t_id_reg_idx, self.num_cols, None))
-        mod.add(ti.staticMultiply(ti.vgpr(addr_reg_idx), ti.vgpr(addr_reg_idx), self.bpe * self.num_cols, None))
-        mod.add(ti.DSLoadB32(ti.vgpr(addr_reg_idx), ti.vgpr(addr_reg_idx), False))
-        mod.add(ti.SWaitCnt(lgkmcnt=0))
-        return mod, addr_reg_idx
-
-    def sum_elem(self) -> Tuple[ti.Module, int]:
-        return self.max_elem()
-
-    def lds_sum(self, lds_addr0: int, lds_addr1: int, sync: bool = True):
-        '''
-        lds[lds_addr0] += lds[lds_addr1]
-        '''
-        module = ti.Module()
-        data_reg_idx_0 = self.vgpr_pool.checkOut(2)
-        data_reg_idx_1 = data_reg_idx_0 + 1
-        sum_reg_idx = data_reg_idx_0
-        module.add(ti.DSLoadB32(ti.vgpr(data_reg_idx_0), ti.vgpr(lds_addr0), False))
-        module.add(ti.DSLoadB32(ti.vgpr(data_reg_idx_1), ti.vgpr(lds_addr1), False))
-        module.add(ti.SWaitCnt(lgkmcnt=0))
-        module.add(ti.VAddF32(ti.vgpr(sum_reg_idx), ti.vgpr(data_reg_idx_0), ti.vgpr(data_reg_idx_1)))
-        module.add(ti.DSStoreB32(ti.vgpr(lds_addr0), ti.vgpr(sum_reg_idx)))
-
-        if sync:
-            module.add(ti.SWaitCnt(lgkmcnt=0))
-            module.add(ti.SBarrier())
-
-        self.vgpr_pool.checkIn(data_reg_idx_0)
-        return module
-
-    def reduction_sum(self, n_reg_idx: int) -> ti.Module:
-        module = ti.Module()
-
-        if self.debug_label:
-            module.add(ti.Label('reduction_sum', 'reduction max begins'))
-
-        num_iter = round(log2(self.num_cols))
-        l_reg_idx = self.vgpr_pool.checkOut(4)
-        r_reg_idx = l_reg_idx + 1
-        col_reg_idx = l_reg_idx + 2
-        byte_offset_reg_idx = l_reg_idx + 3
-        t_id_reg_idx = self.t_id_reg_idx
-        module.add(ti.vectorStaticDivideAndRemainder(byte_offset_reg_idx, col_reg_idx, t_id_reg_idx, self.num_cols, None))
-        module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.num_cols, None))
-        module.add(ti.VAddU32(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), ti.vgpr(col_reg_idx)))
-        module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.bpe, None))
-        module.add(ti.VMovB32(ti.vgpr(l_reg_idx), ti.vgpr(byte_offset_reg_idx)))
-
-        with ti.allocTmpGpr(self.sgpr_pool, 2, self.sgpr_pool.size(), 2) as tmp_sgpr_res:
-            cmp_res_reg_idx = tmp_sgpr_res.idx
-            reduction_col_reg_idx = self.vgpr_pool.checkOut(1)
-
-            for i in range(num_iter):
-                with auto_exec_scope(self.sgpr_pool, module):
-                    s = self.num_cols >> (i + 1)
-                    assert s > 0
-                    cmp_byte_rel_offset = s * self.bpe
-                    module.add(ti.VAddU32(ti.vgpr(reduction_col_reg_idx), hex(s), ti.vgpr(col_reg_idx)))
-                    module.add(ti.VCmpLeU32(ti.sgpr(cmp_res_reg_idx, 2), ti.vgpr(col_reg_idx), ti.sgpr(n_reg_idx)))
-                    module.add(ti.VCmpGtU32(ti.VCC(), hex(s), ti.vgpr(col_reg_idx)))
-                    module.add(ti.SAndB64(ti.sgpr(cmp_res_reg_idx, 2), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
-                    module.add(ti.VCmpLtU32(ti.VCC(), ti.vgpr(reduction_col_reg_idx), ti.sgpr(n_reg_idx)))
-                    module.add(ti.SAndB64(ti.EXEC(), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
-                    module.add(ti.VAddU32(ti.vgpr(r_reg_idx), hex(cmp_byte_rel_offset), ti.vgpr(l_reg_idx)))
-                    module.add(self.lds_sum(l_reg_idx, r_reg_idx))
-
-            self.vgpr_pool.checkIn(reduction_col_reg_idx)
-
-        self.vgpr_pool.checkIn(l_reg_idx)
-        return module
-
-    def reduction_max(self, n_reg_idx: Union[int, str]) -> ti.Module:
-        module = ti.Module()
-
-        if self.debug_label:
-            module.add(ti.Label('reduction_max', 'reduction max begins'))
-
-        num_iter = round(log2(self.num_cols))
-        l_reg_idx = self.vgpr_pool.checkOut(4)
-        r_reg_idx = l_reg_idx + 1
-        col_reg_idx = l_reg_idx + 2
-        byte_offset_reg_idx = l_reg_idx + 3
-        t_id_reg_idx = self.t_id_reg_idx
-        module.add(ti.vectorStaticDivideAndRemainder(byte_offset_reg_idx, col_reg_idx, t_id_reg_idx, self.num_cols, None))
-        module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.num_cols, None))
-        module.add(ti.VAddU32(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), ti.vgpr(col_reg_idx)))
-        module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.bpe, None))
-        module.add(ti.VMovB32(ti.vgpr(l_reg_idx), ti.vgpr(byte_offset_reg_idx)))
-
-        with ti.allocTmpGpr(self.sgpr_pool, 2, self.sgpr_pool.size(), 2) as tmp_sgpr_res:
-            cmp_res_reg_idx = tmp_sgpr_res.idx
-            reduction_col_reg_idx = self.vgpr_pool.checkOut(1)
-
-            for i in range(num_iter):
-                with auto_exec_scope(self.sgpr_pool, module):
-                    s = self.num_cols >> (i + 1)
-                    assert s > 0
-                    cmp_byte_rel_offset = s * self.bpe
-                    module.add(ti.VAddU32(ti.vgpr(reduction_col_reg_idx), hex(s), ti.vgpr(col_reg_idx)))
-                    module.add(ti.VCmpLeU32(ti.sgpr(cmp_res_reg_idx, 2), ti.vgpr(col_reg_idx), ti.sgpr(n_reg_idx)))
-                    module.add(ti.VCmpGtU32(ti.VCC(), hex(s), ti.vgpr(col_reg_idx)))
-                    module.add(ti.SAndB64(ti.sgpr(cmp_res_reg_idx, 2), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
-                    module.add(ti.VCmpLtU32(ti.VCC(), ti.vgpr(reduction_col_reg_idx), ti.sgpr(n_reg_idx)))
-                    module.add(ti.SAndB64(ti.EXEC(), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
-                    module.add(ti.VAddU32(ti.vgpr(r_reg_idx), hex(cmp_byte_rel_offset), ti.vgpr(l_reg_idx)))
-                    module.add(self.lds_max(l_reg_idx, r_reg_idx))
-
-            self.vgpr_pool.checkIn(reduction_col_reg_idx)
-
-        self.vgpr_pool.checkIn(l_reg_idx)
-        return module
-
-    def sub_max(self, data_reg_idx, max_elem_reg_idx) -> ti.Module:
-        mod = ti.Module()
-        mod.add(ti.VSubF32(ti.vgpr(data_reg_idx), ti.vgpr(data_reg_idx), ti.vgpr(max_elem_reg_idx)))
-        return mod
-
-    def exp(self, data_reg_idx) -> ti.Module:
-        mod = ti.Module()
-
-        if self.debug_label:
-            mod.add(ti.Label('exp', 'exp begins'))
-
-        mod.add(ti.VMulF32(ti.vgpr(data_reg_idx), 1.0 / log(2), ti.vgpr(data_reg_idx)))
-        mod.add(ti.VExpF32(ti.vgpr(data_reg_idx), ti.vgpr(data_reg_idx)))
-        return mod
-
-    def div_sum(self, data_reg_idx, sum_reg_idx, safe: bool = False) -> ti.Module:
-        mod = ti.Module()
-
-        if self.debug_label:
-            mod.add(ti.Label('div_sum', 'div sum begins'))
-
-        assert safe is False, 'currently support plain div only'
-
-        mod.add(ti.VRcpF32(ti.vgpr(sum_reg_idx), ti.vgpr(sum_reg_idx)))
-        mod.add(ti.VMulF32(ti.vgpr(data_reg_idx), ti.vgpr(data_reg_idx), ti.vgpr(sum_reg_idx)))
-        return mod
-
-    def global_write_data(self,
-                          data_reg_idx: int,
-                          srd_reg_idx: int,
-                          n_reg_idx: int,
-                          wg_byte_offset_reg_idx: int,
-                          sync: bool):
-        module = ti.Module()
-
-        if self.debug_label:
-            module.add(ti.Label('global_write_data', 'global write begins'))
-
-        with auto_exec_scope(self.sgpr_pool, module):
-            col_reg_idx = self.vgpr_pool.checkOut(1)
-            module.add(ti.vectorStaticRemainder(None, col_reg_idx, self.t_id_reg_idx, self.num_cols, None, None))
-            module.add(ti.VCmpXLtU32(ti.VCC(), ti.vgpr(col_reg_idx), ti.sgpr(n_reg_idx)))
-            self.vgpr_pool.checkIn(col_reg_idx)
-            local_offset_mod, local_byte_offset_reg_idx = self.local_offset(n_reg_idx)
-            module.add(local_offset_mod)
-
-            GlobalWriteInstType = self.global_write_inst_type(1)
-            module.add(GlobalWriteInstType(ti.vgpr(data_reg_idx), ti.vgpr(local_byte_offset_reg_idx), ti.sgpr(srd_reg_idx, self.srd_num_reg), ti.sgpr(wg_byte_offset_reg_idx), ti.MUBUFModifiers(offen=True)))
-
-            if sync:
-                module.add(ti.SWaitCnt(vmcnt=0))
-
-            self.vgpr_pool.checkIn(local_byte_offset_reg_idx)
-        return module
 
     def kernel_args(self):
         return (KernelArgument(8, 0, 'global_buffer', 'global'),
                 KernelArgument(8, 8, 'global_buffer', 'global'),
                 KernelArgument(4, 16, 'by_value'),
-                KernelArgument(4, 20, 'by_value'))
+                KernelArgument(4, 20, 'by_value'),
+                KernelArgument(4, 24, 'by_value'))
 
-    def increment_row_tile_addr(self, srd_reg_indices: Tuple[Union[int, str]], stride_reg_idx: Union[int, str]) -> ti.Module:
-        mod = ti.Module()
 
-        def higher_bits(reg_idx):
-            if isinstance(reg_idx, int):
-                return reg_idx + 1
-            elif isinstance(reg_idx, str):
-                return f'{reg_idx}+1'
+    def defineVariables(self):
+        self.defineVgpr("Serial",  1, 1)
+        self.defineVgpr("Src",     2, 2)
+        self.defineVgpr("Dst",     2, 2)
+        self.defineVgpr("Mean",    1, 1)
+        self.defineVgpr("Sigma2",  1, 1)
+        self.defineVgpr("MeanB",   1, 1)
+        self.defineVgpr("Sigma2B", 1, 1)
+        self.defineVgpr("Widx",    1, 1)
+        self.defineVgpr("Offset",  1, 1)
+        self.defineVgpr("Value",   4, 4)
+        self.defineVgpr("Tmp",     1, 1)
 
-        with ti.allocTmpGpr(self.sgpr_pool, 1, self.sgpr_pool.size(), None) as tmpRes:
-            mod.add(ti.SMulI32(ti.sgpr(tmpRes.idx, tmpRes.size),
-                               ti.sgpr(stride_reg_idx, 1),
-                               self.bpe * self.num_rows_processed_per_iter))
-            for srd_reg_idx in set(srd_reg_indices):
-                mod.add(ti.SAddU32(ti.sgpr(srd_reg_idx, 1), ti.sgpr(srd_reg_idx, 1), ti.sgpr(tmpRes.idx, tmpRes.size), 'lower bits'))
-                srd_addr_higher_bits = higher_bits(srd_reg_idx)
-                mod.add(ti.SAddCU32(ti.sgpr(srd_addr_higher_bits, 1), ti.sgpr(srd_addr_higher_bits, 1), 0, 'higher bits'))
+        self.defineSgpr("KernelArg", 2)
+        self.defineSgpr("WorkGroup0", 1)
+        self.defineSgpr("WorkGroup1", 1)
+        self.defineSgpr("WorkGroup2", 1)
+        self.defineSgpr("AddressIn", 2, 2)
+        self.defineSgpr("AddressOut", 2, 2)
+        self.defineSgpr("SizeLength", 1)
+        self.defineSgpr("Eps", 1)
+        self.defineSgpr("MainLoop", 1)
+        self.defineSgpr("Offset", 1)
+        self.defineSgpr("Src", 4, 4)
+        self.defineSgpr("Dst", 4, 4)
+        self.defineSgpr("Tmp", 6, 2)
+
+        mod = ti.Module("defineVariables")
+
+        for vkey in self.vgprs:
+            mod.add(ti.RegSet("v", "vgpr"+vkey, self.vgprs[vkey]))
+        mod.addSpaceLine()
+
+        for skey in self.sgprs:
+            mod.add(ti.RegSet("s", "sgpr"+skey, self.sgprs[skey]))
+        mod.addSpaceLine()
+
+        mod.add(ti.ValueSet("Srd127_96", "0x00020000", format=-1))
+        mod.add(ti.ValueSet("BufferLimit", "0xffffffff", format=-1))
+        mod.addSpaceLine()
+
         return mod
 
-    def increment_row_tile_offset(self, wg_offset_reg_indices: Tuple[Union[int, str]], stride_reg_idx: Union[int, str]) -> ti.Module:
-        mod = ti.Module()
 
-        with ti.allocTmpGpr(self.sgpr_pool, 1, self.sgpr_pool.size(), None) as tmpRes:
-            mod.add(ti.SMulI32(ti.sgpr(tmpRes.idx, tmpRes.size),
-                               ti.sgpr(stride_reg_idx, 1),
-                               self.bpe * self.num_rows_processed_per_iter))
-            for wg_offset_reg_idx in set(wg_offset_reg_indices):
-                mod.add(ti.SAddU32(ti.sgpr(wg_offset_reg_idx, 1), ti.sgpr(wg_offset_reg_idx, 1), ti.sgpr(tmpRes.idx, tmpRes.size)))
+    def load_kernel_args(self):
+        mod = ti.Module('Load kernel args')
+        mod.addComment0('Load kernel args')
+        mod.add(ti.SLoadB64(ti.sgpr("AddressIn", 2), ti.sgpr("KernelArg", 2), 0))
+        mod.add(ti.SLoadB64(ti.sgpr("AddressOut", 2), ti.sgpr("KernelArg", 2), 8))
+        mod.add(ti.SLoadB32(ti.sgpr("SizeLength"), ti.sgpr("KernelArg", 2), 20))
+        mod.add(ti.SLoadB32(ti.sgpr("Eps"), ti.sgpr("KernelArg", 2), 24))
+        mod.add(ti.SWaitCnt(lgkmcnt=0))
+        mod.addSpaceLine()
         return mod
 
-    def softmax_kernel_body(self) -> ti.Module:
+
+    def init_param(self) -> ti.Module:
+        mod = ti.Module("defineVariables")
+        mod.addComment0("defineVariables")
+        mod.add(ti.SMovB32(ti.sgpr("Src+0"), ti.sgpr("AddressIn+0")))
+        mod.add(ti.SMovB32(ti.sgpr("Src+1"), ti.sgpr("AddressIn+1")))
+        mod.add(ti.SMovB32(ti.sgpr("Src+2"), "BufferLimit"))
+        mod.add(ti.SMovB32(ti.sgpr("Src+3"), "Srd127_96"))
+        mod.addSpaceLine()
+
+        mod.add(ti.SMovB32(ti.sgpr("Dst+0"), ti.sgpr("AddressOut+0")))
+        mod.add(ti.SMovB32(ti.sgpr("Dst+1"), ti.sgpr("AddressOut+1")))
+        mod.add(ti.SMovB32(ti.sgpr("Dst+2"), "BufferLimit"))
+        mod.add(ti.SMovB32(ti.sgpr("Dst+3"), "Srd127_96"))
+        mod.addSpaceLine()
+
+        mod.add(ti.VMovB32(ti.vgpr("Mean"), 0.0))
+        mod.add(ti.VMovB32(ti.vgpr("Sigma2"), 0.0))
+        mod.addSpaceLine()
+        return mod
+
+
+    def calculate_global_address(self) -> ti.Module:
+        mod = ti.Module("calculate_global_address")
+        mod.addComment0("calculate_global_address")
+        mod.add(ti.SMulI32(ti.sgpr("Tmp"), ti.sgpr("WorkGroup1"), ti.sgpr("SizeLength")))
+        mod.add(ti.VLShiftLeftB32(ti.vgpr("Offset"), "0x2", ti.vgpr("Serial")))
+        mod.add(ti.VAddLShiftLeftU32(ti.vgpr("Offset"), "0x2", ti.sgpr("Tmp"), ti.vgpr("Offset")))
+        mod.addSpaceLine()
+        return mod
+
+
+    def sum_per_data(self, val) -> ti.Module:
+        mod = ti.Module("sum_per_data")
+        mod.add(ti.VAddF32(ti.vgpr("Mean"), ti.vgpr("Mean"), val))
+        mod.add(ti.VMulF32(ti.vgpr("Tmp"), val, val))
+        mod.add(ti.VAddF32(ti.vgpr("Sigma2"), ti.vgpr("Sigma2"), ti.vgpr("Tmp")))
+        mod.addSpaceLine()
+        return mod
+
+
+    def sum_per_threadx4(self) -> ti.Module:
+        mod = ti.Module("sum_per_threadx4")
+        mod.addComment0("sum_per_threadx4")
+        mod.add(ti.SLShiftRightB32(ti.sgpr("MainLoop"), 10, ti.sgpr("SizeLength")))
+        with asm_loop(mod, "sum_per_threadx4", "MainLoop"):
+            mod.add(ti.BufferLoadB128(ti.vgpr("Value",4), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
+            mod.add(ti.SWaitCnt(vmcnt=0))
+            mod.addSpaceLine()
+            mod.add(self.sum_per_data(ti.vgpr("Value+0")))
+            mod.add(self.sum_per_data(ti.vgpr("Value+1")))
+            mod.add(self.sum_per_data(ti.vgpr("Value+2")))
+            mod.add(self.sum_per_data(ti.vgpr("Value+3")))
+            mod.add(ti.SMovB32(ti.sgpr("Tmp"), 4096))
+            mod.add(ti.VAddU32(ti.vgpr("Offset"), ti.vgpr("Offset"), ti.sgpr("Tmp")))
+            mod.addSpaceLine()
+        return mod
+
+
+    def adjusst_global_address(self) -> ti.Module:
+        mod = ti.Module("adjusst_global_address")
+        mod.add(ti.VMulLOU32(ti.vgpr("Tmp"), 3, ti.vgpr("Serial")))
+        mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 2, ti.vgpr("Tmp")))
+        mod.add(ti.VSubU32(ti.vgpr("Offset"), ti.vgpr("Offset"), ti.vgpr("Tmp")))
+        mod.addSpaceLine()
+        return mod
+
+
+    def sum_per_thread(self) -> ti.Module:
+        mod = ti.Module("sum_per_thread")
+        mod.addComment0("sum_per_thread")
+        mod.add(ti.SLShiftRightB32(ti.sgpr("MainLoop"), 8, ti.sgpr("SizeLength")))
+        mod.add(ti.SAndB32(ti.sgpr("MainLoop"), ti.sgpr("MainLoop"), 0x3))
+        with asm_loop(mod, "sum_per_thread", "MainLoop"):
+            mod.add(ti.BufferLoadB32(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
+            mod.add(ti.SWaitCnt(vmcnt=0))
+            mod.addSpaceLine()
+            mod.add(self.sum_per_data(ti.vgpr("Value")))
+            mod.add(ti.SMovB32(ti.sgpr("Tmp"), 1024))
+            mod.add(ti.VAddU32(ti.vgpr("Offset"), ti.vgpr("Offset"), ti.sgpr("Tmp")))
+            mod.addSpaceLine()
+        return mod
+
+
+    def sum_in_some_thread(self)  -> ti.Module:
+        label_sum_end = ti.Label("sum", f'loop sum end')
+        mod = ti.Module("sum_in_some_thread")
+        mod.addComment0("sum_in_some_thread")
+        mod.add(ti.SAndB32(ti.sgpr("MainLoop"), ti.sgpr("SizeLength"), 255))
+        mod.add(ti.VCmpLtU32("vcc", ti.vgpr("Serial"), ti.sgpr("MainLoop")))
+        mod.add(ti.SMovB64("exec", "vcc"))
+        mod.add(ti.SNop(1))
+        mod.add(ti.SCBranchExecZ(label_sum_end.getLabelName()))
+        mod.add(ti.BufferLoadB32(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
+        mod.add(ti.SWaitCnt(vmcnt=0))
+        mod.addSpaceLine()
+        mod.add(self.sum_per_data(ti.vgpr("Value")))
+        mod.add(label_sum_end)
+        mod.add(ti.SMovB64("exec", "-1"))
+        mod.add(ti.SNop(1))
+        mod.addSpaceLine()
+        return mod
+
+
+    def merge_sum(self) -> ti.Module:
+        mod = ti.Module("merge_sum")
+        mod.add(ti.VAddF32(ti.vgpr("Mean"), ti.vgpr("Mean"), ti.vgpr("MeanB")))
+        mod.add(ti.VAddF32(ti.vgpr("Sigma2"), ti.vgpr("Sigma2"), ti.vgpr("Sigma2B")))
+        return mod
+
+
+    def intra_wave_reduction(self) -> ti.Module:
+        label = ti.Label("permute", f'permuge')
+        mod = ti.Module("intra_wave_reduction")
+        mod.addComment0("intra_wave_reduction")
+        mod.add(ti.SMovB32(ti.sgpr("Tmp"), 1))
+        mod.add(label)
+        mod.addSpaceLine()
+        mod.add(ti.VAddU32(ti.vgpr("Tmp"), ti.sgpr("Tmp"), ti.vgpr("Serial")))
+        mod.add(ti.VAndB32(ti.vgpr("Tmp"), 63, ti.vgpr("Tmp")))
+        mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 0x2, ti.vgpr("Tmp")))
+        mod.addSpaceLine()
+        mod.add(ti.DSBPermuteB32(ti.vgpr("MeanB"), ti.vgpr("Tmp"), ti.vgpr("Mean")))
+        mod.add(ti.DSBPermuteB32(ti.vgpr("Sigma2B"), ti.vgpr("Tmp"), ti.vgpr("Sigma2")))
+        mod.add(ti.SWaitCnt(lgkmcnt=0))
+        mod.addSpaceLine()
+        mod.add(self.merge_sum())
+        mod.add(ti.SLShiftLeftB32(ti.sgpr("Tmp"), 1, ti.sgpr("Tmp")))
+        mod.add(ti.SCmpLtU32(ti.sgpr("Tmp"), 64))
+        mod.add(ti.SCBranchSCC1(label.getLabelName()))
+        mod.addSpaceLine()
+        return mod
+
+
+    def inter_wave_reduction(self) -> ti.Module:
+        label_inter = ti.Label("inter", f'inter')
+        label_upper = ti.Label("upper", f'upper')
+        label_lower = ti.Label("lower", f'lower')
+        label_empty = ti.Label("empty", f'empty')
+        label_end   = ti.Label("end", f'end')
+        mod = ti.Module("inter_wave_reduction")
+        mod.addComment0("inter_wave_reduction")
+        mod.add(ti.VLShiftRightB32(ti.vgpr("Widx"), 6, ti.vgpr("Serial")))
+        mod.add(ti.SMovB32(ti.sgpr("Offset"), 4))
+        mod.add(label_inter)
+        mod.add(ti.SLShiftRightB32(ti.sgpr("Offset"), 1, ti.sgpr("Offset")))
+        mod.add(ti.SCmpEQU32(ti.sgpr("Offset"), 0))
+        mod.add(ti.SCBranchSCC1(label_end.getLabelName()))
+        mod.add(ti.SLShiftLeftB32(ti.sgpr("Tmp"), 1, ti.sgpr("Offset")))
+        mod.add(ti.VCmpLtU32(ti.sgpr("Tmp+2",2), ti.vgpr("Widx"), ti.sgpr("Tmp")))
+        mod.add(ti.VCmpGEU32(ti.sgpr("Tmp+4",2), ti.vgpr("Widx"), ti.sgpr("Offset")))
+        mod.add(ti.SAndB64("vcc", ti.sgpr("Tmp+2",2), ti.sgpr("Tmp+4",2)))
+        mod.add(ti.SCBranchVCCNZ(label_upper.getLabelName()))
+        mod.add(ti.VCmpLtU32("vcc", ti.vgpr("Widx"), ti.sgpr("Offset")))
+        mod.add(ti.SCBranchVCCNZ(label_lower.getLabelName()))
+        mod.add(ti.SBranch(label_empty.getLabelName()))
+        mod.add(label_upper)
+        mod.add(ti.VSubU32(ti.vgpr("Tmp"), ti.vgpr("Widx"), ti.sgpr("Offset")))
+        mod.add(ti.VMulLOU32(ti.vgpr("Tmp"), ti.vgpr("Tmp"), 2))
+        mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 2, ti.vgpr("Tmp")))
+        ds = ti.DSModifiers(offset=0)
+        mod.add(ti.DSStoreB32(ti.vgpr("Tmp"), ti.vgpr("Mean"), ds))
+        ds = ti.DSModifiers(offset=4)
+        mod.add(ti.DSStoreB32(ti.vgpr("Tmp"), ti.vgpr("Sigma2"), ds))
+        mod.add(ti.SWaitCnt(lgkmcnt=0))
+        mod.add(ti.SBarrier())
+        mod.add(ti.SBranch(label_inter.getLabelName()))
+        mod.add(label_lower)
+        mod.add(ti.SBarrier())
+        mod.add(ti.VMulLOU32(ti.vgpr("Tmp"), ti.vgpr("Widx"), 2))
+        mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 2, ti.vgpr("Tmp")))
+        ds = ti.DSModifiers(offset=0)
+        mod.add(ti.DSLoadB32(ti.vgpr("MeanB"), ti.vgpr("Tmp"), ds))
+        ds = ti.DSModifiers(offset=4)
+        mod.add(ti.DSLoadB32(ti.vgpr("Sigma2B"), ti.vgpr("Tmp"), ds))
+        mod.add(ti.SWaitCnt(lgkmcnt=0))
+        mod.add(self.merge_sum())
+        mod.add(ti.SBranch(label_inter.getLabelName()))
+        mod.add(label_empty)
+        mod.add(ti.SBarrier())
+        mod.add(ti.SBranch(label_inter.getLabelName()))
+        mod.add(label_end)
+        mod.addSpaceLine()
+        return mod
+
+
+    def broadcast(self) -> ti.Module:
+        label_lower = ti.Label("broadcast_lower", f'broadcast_lower')
+        label_end = ti.Label("broadcast_end", f'broadcast_end')
+
+        mod = ti.Module("broadcast")
+        mod.addComment0("broadcast")
+        mod.add(ti.VCmpEQU32("vcc", ti.vgpr("Widx"), 0))
+        mod.add(ti.SCBranchVCCZ(label_lower.getLabelName()))
+        ds = ti.DSModifiers(offset=0)
+        mod.add(ti.DSStoreB32(ti.vgpr("Widx"), ti.vgpr("Mean"), ds))
+        ds = ti.DSModifiers(offset=4)
+        mod.add(ti.DSStoreB32(ti.vgpr("Widx"), ti.vgpr("Sigma2"), ds))
+        mod.add(ti.SWaitCnt(lgkmcnt=0))
+        mod.add(ti.SBarrier())
+        mod.add(ti.SBranch(label_end.getLabelName()))
+        mod.add(label_lower)
+        mod.add(ti.SBarrier())
+        mod.add(ti.VMovB32(ti.vgpr("Tmp"), 0))
+        ds = ti.DSModifiers(offset=0)
+        mod.add(ti.DSLoadB32(ti.vgpr("Mean"), ti.vgpr("Tmp"), ds))
+        ds = ti.DSModifiers(offset=4)
+        mod.add(ti.DSLoadB32(ti.vgpr("Sigma2"), ti.vgpr("Tmp"), ds))
+        mod.add(ti.SWaitCnt(lgkmcnt=0))
+        mod.add(label_end)
+        mod.addSpaceLine()
+        return mod
+
+
+    def get_average(self) -> ti.Module:
+        mod = ti.Module("get_average")
+        mod.addComment0("get_average")
+        mod.add(ti.VCvtI32toF32(ti.vgpr("Tmp"), ti.sgpr("SizeLength")))
+        mod.add(ti.VRcpF32(ti.vgpr("Tmp"), ti.vgpr("Tmp")))
+        mod.add(ti.VMulF32(ti.vgpr("Mean"), ti.vgpr("Mean"), ti.vgpr("Tmp")))
+        mod.add(ti.VMulF32(ti.vgpr("Sigma2"), ti.vgpr("Sigma2"), ti.vgpr("Tmp")))
+        mod.addSpaceLine()
+        mod.add(ti.VMulF32(ti.vgpr("Tmp"), ti.vgpr("Mean"), ti.vgpr("Mean")))
+        mod.add(ti.VSubF32(ti.vgpr("Sigma2"), ti.vgpr("Sigma2"), ti.vgpr("Tmp")))
+        mod.add(ti.VAddF32(ti.vgpr("Sigma2"), ti.vgpr("Sigma2"), ti.sgpr("Eps")))
+        mod.add(ti.TextBlock("v_sqrt_f32 v[vgprSigma2], v[vgprSigma2]\n"))
+        mod.add(ti.VRcpF32(ti.vgpr("Sigma2"), ti.vgpr("Sigma2")))
+        mod.addSpaceLine()
+        return mod
+
+
+    def layernorm_cal(self, val) -> ti.Module:
+        mod = ti.Module("layernorm_cal")
+        mod.add(ti.VSubF32(val, val, ti.vgpr("Mean")))
+        mod.add(ti.VMulF32(val, val, ti.vgpr("Sigma2")))
+        return mod
+
+
+    def layernorm_threadx4(self) -> ti.Module:
+        mod = ti.Module("layernorm_threadx4")
+        mod.addComment0("layernorm_threadx4")
+        mod.add(ti.SLShiftRightB32(ti.sgpr("MainLoop"), 10, ti.sgpr("SizeLength")))
+        with asm_loop(mod, "layernorm_threadx4", "MainLoop"):
+            mod.add(ti.BufferLoadB128(ti.vgpr("Value",4), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
+            mod.add(ti.SWaitCnt(vmcnt=0))
+            mod.add(self.layernorm_cal(ti.vgpr("Value+0")))
+            mod.add(self.layernorm_cal(ti.vgpr("Value+1")))
+            mod.add(self.layernorm_cal(ti.vgpr("Value+2")))
+            mod.add(self.layernorm_cal(ti.vgpr("Value+3")))
+            mod.add(ti.BufferStoreB128(ti.vgpr("Value",4), ti.vgpr("Offset"), ti.sgpr("Dst",4), 0, ti.MUBUFModifiers(offen=True)))
+            mod.add(ti.SWaitCnt(vmcnt=0))
+            mod.add(ti.SMovB32(ti.sgpr("Tmp"), 4096))
+            mod.add(ti.VAddU32(ti.vgpr("Offset"), ti.vgpr("Offset"), ti.sgpr("Tmp")))
+            mod.addSpaceLine()
+        return mod
+
+
+    def layernorm_thread(self) -> ti.Module:
+        mod = ti.Module("layernorm_thread")
+        mod.addComment0("layernorm_thread")
+        mod.add(ti.SLShiftRightB32(ti.sgpr("MainLoop"), 8, ti.sgpr("SizeLength")))
+        mod.add(ti.SAndB32(ti.sgpr("MainLoop"), ti.sgpr("MainLoop"), 0x3))
+        with asm_loop(mod, "layernorm_thread", "MainLoop"):
+            mod.add(ti.BufferLoadB32(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
+            mod.add(ti.SWaitCnt(vmcnt=0))
+            mod.add(self.layernorm_cal(ti.vgpr("Value")))
+            mod.add(ti.BufferStoreB32(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Dst",4), 0, ti.MUBUFModifiers(offen=True)))
+            mod.add(ti.SWaitCnt(vmcnt=0))
+            mod.add(ti.SMovB32(ti.sgpr("Tmp"), 1024))
+            mod.add(ti.VAddU32(ti.vgpr("Offset"), ti.vgpr("Offset"), ti.sgpr("Tmp")))
+            mod.addSpaceLine()
+        return mod
+
+
+    def layernorm_in_some_thread(self)  -> ti.Module:
+        label_layernorm_end = ti.Label("layernorm", f'loop layernorm end')
+        mod = ti.Module("layernorm_in_some_thread")
+        mod.addComment0("layernorm_in_some_thread")
+        mod.add(ti.SAndB32(ti.sgpr("MainLoop"), ti.sgpr("SizeLength"), 255))
+        mod.add(ti.VCmpLtU32("vcc", ti.vgpr("Serial"), ti.sgpr("MainLoop")))
+        mod.add(ti.SMovB64("exec", "vcc"))
+        mod.add(ti.SNop(1))
+        mod.add(ti.SCBranchExecZ(label_layernorm_end.getLabelName()))
+        mod.add(ti.BufferLoadB32(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
+        mod.add(ti.SWaitCnt(vmcnt=0))
+        mod.add(self.layernorm_cal(ti.vgpr("Value")))
+        mod.add(ti.BufferStoreB32(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Dst",4), 0, ti.MUBUFModifiers(offen=True)))
+        mod.add(ti.SWaitCnt(vmcnt=0))
+        mod.add(label_layernorm_end)
+        mod.add(ti.SMovB64("exec", "-1"))
+        mod.add(ti.SNop(1))
+        mod.addSpaceLine()
+        return mod
+
+
+    def layernorm_kernel_body(self) -> ti.Module:
         mod = ti.Module(self.func_name)
+        mod.add(self.defineVariables())
         with asm_func(self.func_name, mod):
-            kernel_args_load_mod, input_srd, output_srd, m_reg_idx, n_reg_idx = self.load_kernel_args()
-            mod.add(kernel_args_load_mod)
-            wg_offset_mod, wg_offset_reg_idx = self.setup_global_read_wg_offset(n_reg_idx)
-            mod.add(wg_offset_mod)
-
-            with asm_loop(self.sgpr_pool, mod, 'ext_loop') as (loop_counter_res, start_label, end_label):
-                local_offset_mod, local_offset_byte_offset_reg_idx = self.local_offset(None)
-                mod.add(local_offset_mod)
-                gl_mod, data_reg_idx = self.global_read(input_srd, wg_offset_reg_idx, n_reg_idx, True)
-                mod.add(gl_mod)
-                mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
-
-                if self.numerically_stable:
-                    mod.add(self.reduction_max(n_reg_idx))
-                    max_addr_mod, max_reg_idx = self.max_elem()
-                    mod.add(max_addr_mod)
-                    mod.add(self.sub_max(data_reg_idx, max_reg_idx))
-                    self.vgpr_pool.checkIn(max_reg_idx)
-
-                mod.add(self.exp(data_reg_idx))
-                mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
-                mod.add(self.reduction_sum(n_reg_idx))
-                sum_elem_mod, sum_reg_idx = self.sum_elem()
-                mod.add(sum_elem_mod)
-                mod.add(self.div_sum(data_reg_idx, sum_reg_idx))
-                self.vgpr_pool.checkIn(sum_reg_idx)
-                gw_mod = self.global_write_data(data_reg_idx, output_srd, n_reg_idx, wg_offset_reg_idx, False)
-                mod.add(gw_mod)
-                mod.add(ti.SAddU32(ti.sgpr(loop_counter_res.idx, loop_counter_res.size),
-                                   ti.sgpr(loop_counter_res.idx, loop_counter_res.size),
-                                   self.num_rows_processed_per_iter,
-                                   'i += loopStepM'))
-                mod.add(self.increment_row_tile_offset((wg_offset_reg_idx,), n_reg_idx))
-                mod.add(ti.SCmpLtU32(ti.sgpr(loop_counter_res.idx, loop_counter_res.size), self.num_rows, 'check if i < tileM'))
-                mod.add(ti.SCBranchSCC1(start_label.getLabelName()))
-                mod.add(ti.SBranch(end_label.getLabelName()))
-                self.sgpr_pool.checkIn(wg_offset_reg_idx)
-                self.sgpr_pool.checkIn(m_reg_idx)
-                self.sgpr_pool.checkIn(n_reg_idx)
-                self.vgpr_pool.checkIn(data_reg_idx)
-                self.vgpr_pool.checkIn(local_offset_byte_offset_reg_idx)
-
-            mod.add(ti.SEndpgm())
-            self.sgpr_pool.checkIn(input_srd)
-            self.sgpr_pool.checkIn(output_srd)
+            mod.add(self.load_kernel_args())
+            mod.add(self.init_param())
+            mod.add(self.calculate_global_address())
+            mod.add(self.sum_per_threadx4())
+            mod.addSpaceLine()
+            mod.add(self.adjusst_global_address())
+            mod.add(self.sum_per_thread())
+            mod.add(self.sum_in_some_thread())
+            mod.add(self.intra_wave_reduction())
+            mod.add(self.inter_wave_reduction())
+            mod.add(self.broadcast())
+            mod.add(self.get_average())
+            mod.add(self.calculate_global_address())
+            mod.add(self.layernorm_threadx4())
+            mod.add(self.adjusst_global_address())
+            mod.add(self.layernorm_thread())
+            mod.add(self.layernorm_in_some_thread())
         return mod
 
 def kernel_rodata(name: str):
@@ -720,7 +612,7 @@ def meta_str(kernels: Tuple[KernelMeta]):
     beg = '.amdgpu_metadata\n---'
     content_str = yaml.dump({'amdhsa.version': [1, 1], 'amdhsa.kernels': [kernel.to_dict() for kernel in kernels]})
     end = '.end_amdgpu_metadata'
-    return '\n'.join([beg, content_str, end])
+    return '\n'.join([beg, content_str, end, ''])
 
 
 if __name__ == '__main__':
@@ -750,16 +642,15 @@ if __name__ == '__main__':
         toolchain_path = globalParameters['AssemblerPath']
 
     ti.Base._global_ti.init(isa, toolchain_path, False)
-    softmax = SoftmaxKernelGenerator(ti.DataType('S'), n, m, 256, arch)
-    kernel_body = softmax.softmax_kernel_body()
-    args = softmax.kernel_args()
-    func_name = softmax.func_name
-    meta = KernelMeta(func_name, softmax.vgpr_pool.size(), softmax.sgpr_pool.size(), 0, softmax.lds_usage_byte, 64, 256, 8, args)
+    layernorm = LayerNormKernelGenerator(ti.DataType('S'), n, m, 256, arch)
+    kernel_body = layernorm.layernorm_kernel_body()
+    args = layernorm.kernel_args()
+    func_name = layernorm.func_name
+    meta = KernelMeta(func_name, layernorm.vgpr_pool.size(), layernorm.sgpr_pool.size(), 0, layernorm.lds_usage_byte, 64, 256, 8, args)
     meta.update_args_offsets()
-    k_str = '\n'.join([kernel_header(func_name, arch),
-                       str(kernel_body),
-                       kernel_rodata(func_name),
-                       meta_str((meta,))])
+    k_str = '\n'.join([kernel_header(func_name, arch, layernorm.vgpr_pool.size(), layernorm.sgpr_pool.size(), layernorm.lds_usage_byte),
+                       meta_str((meta,)),
+                       str(kernel_body)])
 
     with open(output_path, 'w') as f:
         f.write(k_str)
@@ -773,4 +664,4 @@ if __name__ == '__main__':
 
     ret = subprocess.run([toolchain_path] + build_args)
     ret = subprocess.run([toolchain_path, '-target', 'amdcgn-amdhsa', '-o', f'{output_path_basename}.co', f'{output_path_basename}.o'])
-    softmax.dump('yaml', f'{output_path_basename}.yaml')
+    layernorm.dump('yaml', f'{output_path_basename}.yaml')

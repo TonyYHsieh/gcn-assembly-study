@@ -15,7 +15,7 @@
 
 
 template<typename DType>
-void cpuLayerNorm(DType *out, DType *in, std::uint32_t batch, std::uint32_t length, DType eps=1e-05)
+void cpuLayerNorm(DType *out, DType *in, std::uint32_t batch, std::uint32_t length, DType eps=1e-05, DType* gamma=nullptr, DType* beta=nullptr)
 {
     std::vector<DType> mean(batch, 0);
     std::vector<DType> var(batch, 0);
@@ -40,15 +40,31 @@ void cpuLayerNorm(DType *out, DType *in, std::uint32_t batch, std::uint32_t leng
         var[i] = std::sqrt(var[i] / length + eps);
 
         // calculate var
-        for(int j=0; j<length; j++) {
+        for(int j=0; j<length; j++)
+        {
             outC[j] = (inC[j] - mean[i]) / var[i];
+
+            if (gamma != nullptr)
+            {
+                outC[j] = outC[j] * gamma[j];
+            }
+
+            if (beta != nullptr)
+            {
+                outC[j] = outC[j] + beta[j];
+            }
         }
     }
 }
 
-hipError_t launchASMLayerNorm(hipFunction_t func, float *src, float *dst, std::uint32_t m, std::uint32_t n, float eps, std::size_t numRuns, bool sync = true) {
+hipError_t launchASMLayerNorm(hipFunction_t func, float *src, float *dst, std::uint32_t m, std::uint32_t n, float eps, float* gamma, float* beta, std::size_t numRuns) {
+
+    const auto numWorkgroups = m;
+
     KernelArguments args;
     args.append(src);
+    args.append(gamma);
+    args.append(beta);
     args.append(dst);
     args.append(m);
     args.append(n);
@@ -66,25 +82,20 @@ hipError_t launchASMLayerNorm(hipFunction_t func, float *src, float *dst, std::u
     hipEvent_t beg, end;
     auto err = hipEventCreate(&beg);
     err = hipEventCreate(&end);
-
     err = hipEventRecord(beg);
-    const auto numWorkgroups = m;
 
     for (size_t i = 0; i < numRuns; ++i) {
         err = hipExtModuleLaunchKernel(func, 256, numWorkgroups, 1, 256, 1, 1, 32 * sizeof(float), nullptr, nullptr, launchArgs);
     }
 
     err = hipEventRecord(end);
-
-    if (sync) {
-        err = hipEventSynchronize(end);
-        err = hipDeviceSynchronize();
-    }
+    err = hipEventSynchronize(end);
+    err = hipDeviceSynchronize();
 
     float dur{};
     err = hipEventElapsedTime(&dur, beg, end);
     std::cout << "ASM kernel time: " << std::to_string(dur / numRuns) << " ms\n";
-    std::cout << "Perf: " << numRuns * m * n * 2 * sizeof(float) * 1e3 / std::pow(1024.f, 3) / dur << " GB/s\n";
+//    std::cout << "Perf: " << numRuns * m * n * 2 * sizeof(float) * 1e3 / std::pow(1024.f, 3) / dur << " GB/s\n";
     return err;
 }
 
@@ -119,19 +130,34 @@ void dumpBuffer(const char* title, const std::vector<T>& data, int m, int n)
 int main(int argc, char **argv) {
     hipDevice_t dev{};
     auto err = hipDeviceGet(&dev, 0);
-    assert(argc == 4);
+    assert(argc == 5);
 
     const std::string coPath(argv[1]);
     const std::uint32_t m(std::atoi(argv[2]));
     const std::uint32_t n(std::atoi(argv[3]));
+    const std::uint32_t affine(std::atoi(argv[4]));
     const std::uint32_t numElements = m * n;
 
     std::vector<float> cpuMem(numElements, 0);
+    std::vector<float> cpuGamma(n, 0);
+    std::vector<float> cpuBeta(n, 0);
     randomize(begin(cpuMem), end(cpuMem));
+    randomize(begin(cpuGamma), end(cpuGamma));
+    randomize(begin(cpuBeta), end(cpuBeta));
 
     float *gpuMem{};
     err = hipMalloc(&gpuMem, sizeof(float) * numElements);
     err = hipMemcpyHtoD(gpuMem, cpuMem.data(), cpuMem.size() * sizeof(float));
+
+    float *gpuGamma = nullptr;
+    float *gpuBeta = nullptr;
+    if (affine) {
+        err = hipMalloc(&gpuGamma, sizeof(float) * numElements);
+        err = hipMemcpyHtoD(gpuGamma, cpuGamma.data(), cpuGamma.size() * sizeof(float));
+
+        err = hipMalloc(&gpuBeta, sizeof(float) * numElements);
+        err = hipMemcpyHtoD(gpuBeta, cpuBeta.data(), cpuBeta.size() * sizeof(float));
+    }
 
     float *hipResult{};
     err = hipMalloc(&hipResult, sizeof(float) * numElements);
@@ -143,7 +169,7 @@ int main(int argc, char **argv) {
     err = prepareASMKernel("LayerNorm", coPath, &module, &func);
     if (err)
         std::cout << "find asm kernel failed" << std::endl;
-    err = launchASMLayerNorm(func, gpuMem, hipResult, m, n, 1e-05, 2000);
+    err = launchASMLayerNorm(func, gpuMem, hipResult, m, n, 1e-05, gpuGamma, gpuBeta, 2000);
     if (err)
         std::cout << "launchASMLayerNorm error : " << err << std::endl;
 
@@ -152,7 +178,7 @@ int main(int argc, char **argv) {
     // dumpBuffer("GPU result", asmResult, m, n);
 
     std::vector<float> cpuRef(numElements, 0.f);
-    cpuLayerNorm<float>(cpuRef.data(), cpuMem.data(), m, n, 1e-05);
+    cpuLayerNorm<float>(cpuRef.data(), cpuMem.data(), m, n, 1e-05, gpuGamma, gpuBeta);
     // dumpBuffer("CPU result", cpuRef, m, n);
 
     float error = 0.0;

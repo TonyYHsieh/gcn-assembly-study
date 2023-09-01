@@ -15,11 +15,8 @@
 
 
 template<typename DType>
-void cpuLayerNorm(DType *out, DType *in, std::uint32_t batch, std::uint32_t length, DType eps=1e-05, DType* gamma=nullptr, DType* beta=nullptr)
+void cpuLayerNorm(DType *out, DType *mean, DType *invvar, DType *in, std::uint32_t batch, std::uint32_t length, DType eps=1e-05, DType* gamma=nullptr, DType* beta=nullptr)
 {
-    std::vector<DType> mean(batch, 0);
-    std::vector<DType> var(batch, 0);
-
     // calculate mean
     for(int i=0; i<batch; i++)
     {
@@ -32,17 +29,17 @@ void cpuLayerNorm(DType *out, DType *in, std::uint32_t batch, std::uint32_t leng
         }
         mean[i] = mean[i] / length;
 
-        // calculate var
+        // calculate invvar
         for(int j=0; j<length; j++)
         {
-            var[i] += (inC[j] - mean[i]) * (inC[j] - mean[i]);
+            invvar[i] += (inC[j] - mean[i]) * (inC[j] - mean[i]);
         }
-        var[i] = std::sqrt(var[i] / length + eps);
+        invvar[i] = 1 / std::sqrt(invvar[i] / length + eps);
 
-        // calculate var
+        // calculate invvar
         for(int j=0; j<length; j++)
         {
-            outC[j] = (inC[j] - mean[i]) / var[i];
+            outC[j] = (inC[j] - mean[i]) * invvar[i];
 
             if (gamma != nullptr)
             {
@@ -57,15 +54,17 @@ void cpuLayerNorm(DType *out, DType *in, std::uint32_t batch, std::uint32_t leng
     }
 }
 
-hipError_t launchASMLayerNorm(hipFunction_t func, float *src, float *dst, std::uint32_t m, std::uint32_t n, float eps, float* gamma, float* beta, std::size_t numRuns) {
+hipError_t launchASMLayerNorm(hipFunction_t func, float *dst, float* mean, float* invvar, float *src, std::uint32_t m, std::uint32_t n, float eps, float* gamma, float* beta, std::size_t numRuns) {
 
     const auto numWorkgroups = m;
 
     KernelArguments args;
+    args.append(dst);
+    args.append(mean);
+    args.append(invvar);
     args.append(src);
     args.append(gamma);
     args.append(beta);
-    args.append(dst);
     args.append(m);
     args.append(n);
     args.append(eps);
@@ -85,7 +84,7 @@ hipError_t launchASMLayerNorm(hipFunction_t func, float *src, float *dst, std::u
     err = hipEventRecord(beg);
 
     for (size_t i = 0; i < numRuns; ++i) {
-        err = hipExtModuleLaunchKernel(func, 256, numWorkgroups, 1, 256, 1, 1, 32 * sizeof(float), nullptr, nullptr, launchArgs);
+        err = hipExtModuleLaunchKernel(func, 512, numWorkgroups, 1, 512, 1, 1, 32 * sizeof(float), nullptr, nullptr, launchArgs);
     }
 
     err = hipEventRecord(end);
@@ -152,33 +151,47 @@ int main(int argc, char **argv) {
     float *gpuGamma = nullptr;
     float *gpuBeta = nullptr;
     if (affine) {
-        err = hipMalloc(&gpuGamma, sizeof(float) * numElements);
+        err = hipMalloc(&gpuGamma, sizeof(float) * n);
         err = hipMemcpyHtoD(gpuGamma, cpuGamma.data(), cpuGamma.size() * sizeof(float));
 
-        err = hipMalloc(&gpuBeta, sizeof(float) * numElements);
+        err = hipMalloc(&gpuBeta, sizeof(float) * n);
         err = hipMemcpyHtoD(gpuBeta, cpuBeta.data(), cpuBeta.size() * sizeof(float));
     }
 
     float *hipResult{};
     err = hipMalloc(&hipResult, sizeof(float) * numElements);
     err = hipMemset(hipResult, 0, sizeof(float) * numElements);
-    std::cout << "hipResult address: " << hipResult << std::endl;
+
+    float *hipMean{};
+    err = hipMalloc(&hipMean, sizeof(float) * m);
+    err = hipMemset(hipMean, 0, sizeof(float) * m);
+
+    float *hipInvvar{};
+    err = hipMalloc(&hipInvvar, sizeof(float) * m);
+    err = hipMemset(hipInvvar, 0, sizeof(float) * m);
+
 
     hipModule_t module{};
     hipFunction_t func{};
     err = prepareASMKernel("LayerNorm", coPath, &module, &func);
     if (err)
         std::cout << "find asm kernel failed" << std::endl;
-    err = launchASMLayerNorm(func, gpuMem, hipResult, m, n, 1e-05, gpuGamma, gpuBeta, 2000);
+    err = launchASMLayerNorm(func, hipResult, hipMean, hipInvvar, gpuMem, m, n, 1e-05, gpuGamma, gpuBeta, 2000);
     if (err)
         std::cout << "launchASMLayerNorm error : " << err << std::endl;
 
     std::vector<float> asmResult(numElements, 0.0f);
+    std::vector<float> asmMean(numElements, 0.0f);
+    std::vector<float> asmInvvar(numElements, 0.0f);
     err = hipMemcpyDtoH(asmResult.data(), hipResult, numElements * sizeof(float));
+    err = hipMemcpyDtoH(asmMean.data(), hipMean, m * sizeof(float));
+    err = hipMemcpyDtoH(asmInvvar.data(), hipInvvar, m * sizeof(float));
     // dumpBuffer("GPU result", asmResult, m, n);
 
     std::vector<float> cpuRef(numElements, 0.f);
-    cpuLayerNorm<float>(cpuRef.data(), cpuMem.data(), m, n, 1e-05, gpuGamma, gpuBeta);
+    std::vector<float> cpuMean(m, 0.f);
+    std::vector<float> cpuInvvar(m, 0.f);
+    cpuLayerNorm<float>(cpuRef.data(), cpuMean.data(), cpuInvvar.data(), cpuMem.data(), m, n, 1e-05, gpuGamma, gpuBeta);
     // dumpBuffer("CPU result", cpuRef, m, n);
 
     float error = 0.0;
@@ -201,6 +214,8 @@ int main(int argc, char **argv) {
             cpuinf += 1;
         }
     }
+
+    std::cout << "----- " << "data result" << " -----" << std::endl;
     if (gpunan)
         std::cout << "gpunan: " << gpunan << std::endl;
     if (cpunan)
@@ -209,8 +224,73 @@ int main(int argc, char **argv) {
         std::cout << "gpuinf: " << gpuinf << std::endl;
     if (cpuinf)
         std::cout << "cpuinf: " << cpuinf << std::endl;
-
     std::cout << "Tony max error : " << error << std::endl;
+
+
+    error = 0.0;
+    gpunan = 0;
+    cpunan = 0;
+    gpuinf = 0;
+    cpuinf = 0;
+    for (std::size_t i = 0; i < m; ++i) {
+        error = std::max(error, std::abs(asmMean[i]-cpuMean[i]));
+        if (std::isnan(asmMean[i])) {
+            gpunan += 1;
+        }
+        if (std::isnan(cpuMean[i])) {
+            cpunan += 1;
+        }
+        if (std::isinf(asmMean[i])) {
+            gpuinf += 1;
+        }
+        if (std::isinf(cpuMean[i])) {
+            cpuinf += 1;
+        }
+    }
+
+    std::cout << "----- " << "data result" << " -----" << std::endl;
+    if (gpunan)
+        std::cout << "gpunan: " << gpunan << std::endl;
+    if (cpunan)
+        std::cout << "cpunan: " << cpunan << std::endl;
+    if (gpuinf)
+        std::cout << "gpuinf: " << gpuinf << std::endl;
+    if (cpuinf)
+        std::cout << "cpuinf: " << cpuinf << std::endl;
+    std::cout << "Tony mean max error : " << error << std::endl;
+
+
+    error = 0.0;
+    gpunan = 0;
+    cpunan = 0;
+    gpuinf = 0;
+    cpuinf = 0;
+    for (std::size_t i = 0; i < m; ++i) {
+        error = std::max(error, std::abs(asmInvvar[i]-cpuInvvar[i]));
+        if (std::isnan(asmInvvar[i])) {
+            gpunan += 1;
+        }
+        if (std::isnan(cpuInvvar[i])) {
+            cpunan += 1;
+        }
+        if (std::isinf(asmInvvar[i])) {
+            gpuinf += 1;
+        }
+        if (std::isinf(cpuInvvar[i])) {
+            cpuinf += 1;
+        }
+    }
+
+    std::cout << "----- " << "data result" << " -----" << std::endl;
+    if (gpunan)
+        std::cout << "gpunan: " << gpunan << std::endl;
+    if (cpunan)
+        std::cout << "cpunan: " << cpunan << std::endl;
+    if (gpuinf)
+        std::cout << "gpuinf: " << gpuinf << std::endl;
+    if (cpuinf)
+        std::cout << "cpuinf: " << cpuinf << std::endl;
+    std::cout << "Tony invvar max error : " << error << std::endl;
 
     err = hipFree(gpuMem);
     err = hipModuleUnload(module);

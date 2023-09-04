@@ -18,38 +18,29 @@ template<typename DType>
 void cpuLayerNorm(DType *out, DType *mean, DType *invvar, DType *in, std::uint32_t batch, std::uint32_t length, DType eps=1e-05, DType* gamma=nullptr, DType* beta=nullptr)
 {
     // calculate mean
-    for(int i=0; i<batch; i++)
-    {
+    for(int i=0; i<batch; i++) {
+        int count = 0;
         DType* inC  = in  + i * length;
         DType* outC = out + i * length;
 
-        for(int j=0; j<length; j++)
-        {
-            mean[i] += inC[j];
+        for(int j=0; j<length; j++) {
+            count = count + 1;
+            float delta = inC[j] - mean[i];
+            mean[i] = mean[i] + delta / count;
+            float delta2 = inC[j] - mean[i];
+            invvar[i] = invvar[i] + delta * delta2;
         }
-        mean[i] = mean[i] / length;
+        invvar[i] = 1 / std::sqrt((invvar[i] / length) + eps);
 
         // calculate invvar
-        for(int j=0; j<length; j++)
-        {
-            invvar[i] += (inC[j] - mean[i]) * (inC[j] - mean[i]);
-        }
-        invvar[i] = 1 / std::sqrt(invvar[i] / length + eps);
-
-        // calculate invvar
-        for(int j=0; j<length; j++)
-        {
+        for(int j=0; j<length; j++) {
             outC[j] = (inC[j] - mean[i]) * invvar[i];
 
             if (gamma != nullptr)
-            {
                 outC[j] = outC[j] * gamma[j];
-            }
 
             if (beta != nullptr)
-            {
                 outC[j] = outC[j] + beta[j];
-            }
         }
     }
 }
@@ -84,7 +75,7 @@ hipError_t launchASMLayerNorm(hipFunction_t func, float *dst, float* mean, float
     err = hipEventRecord(beg);
 
     for (size_t i = 0; i < numRuns; ++i) {
-        err = hipExtModuleLaunchKernel(func, 512, numWorkgroups, 1, 512, 1, 1, 32 * sizeof(float), nullptr, nullptr, launchArgs);
+        err = hipExtModuleLaunchKernel(func, 256, numWorkgroups, 1, 256, 1, 1, 32 * sizeof(float), nullptr, nullptr, launchArgs);
     }
 
     err = hipEventRecord(end);

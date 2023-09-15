@@ -99,11 +99,9 @@ def asm_loop(mod: ti.Module, name: str, it: str, sweep_once: int):
 class LayerNormKernelGenerator:
     srd_num_reg = 4
     srd_alignment = 4
-	
+
     def __init__(self,
                  io_type: ti.DataType,
-                 num_cols: int,
-                 num_rows: int,
                  num_workitems: int,
                  num_load_count: int,
                  num_load_size: int,
@@ -127,20 +125,24 @@ class LayerNormKernelGenerator:
 
     @property
     def lds_usage_byte(self) -> int:
-        return 32
+        # used in reduce inter wave mean and invvar
+        # 4 data * half_wave_num * bpe
+        return 4 * (self.num_workitems // 64 // 2) * self.bpe
 
     @property
     def func_name(self):
         return f'LayerNorm'
 
     def dumps(self, format: str) -> str:
+        limit = self.num_workitems * self.num_load_count * self.num_load_size if sweep_once else 99999999999
+
         param_dict = {
+            'arch': self.arch,
+            'op': self.op,
+            'func_name': self.func_name,
             'io_type': self.io_type.toChar(),
             'num_workitems': self.num_workitems,
-            'func_name': self.func_name,
-            'debug_label': self.debug_label,
-            'arch': self.arch,
-            'op': self.op
+            'limit': limit
         }
 
         if format.lower() == 'yaml':
@@ -326,6 +328,7 @@ class LayerNormKernelGenerator:
         mod.add(ti.VAddF32(ti.vgpr("Count"), ti.vgpr("Count"), 1.0))
         mod.add(ti.VSubF32(ti.vgpr("Tmp"), val, ti.vgpr("Mean")))  # delta
         mod.add(ti.VRcpF32(ti.vgpr("Tmp+1"), ti.vgpr("Count"))) # 1 / count
+        mod.add(ti.SNop(waitState=0, comment="1 wait states"))
         mod.add(ti.VMulF32(ti.vgpr("Tmp+1"), ti.vgpr("Tmp"), ti.vgpr("Tmp+1"))) # delta / count
         mod.add(ti.VAddF32(ti.vgpr("Mean"), ti.vgpr("Mean"), ti.vgpr("Tmp+1"))) # new mean
         mod.add(ti.VSubF32(ti.vgpr("Tmp+1"), val, ti.vgpr("Mean")))
@@ -447,6 +450,7 @@ class LayerNormKernelGenerator:
         mod.add(ti.SMovB64("exec", "vcc"))
         mod.add(ti.SNop(1))
         mod.add(ti.VRcpF32(ti.vgpr("Tmp+3"), ti.vgpr("Count")))
+        mod.add(ti.SNop(waitState=0, comment="1 wait states"))
         mod.add(ti.VMulF32(ti.vgpr("Tmp+1"), ti.vgpr("CountA"), ti.vgpr("Tmp+3")))
         mod.add(ti.VMulF32(ti.vgpr("Tmp+2"), ti.vgpr("CountB"), ti.vgpr("Tmp+3")))
         mod.add(ti.VMulF32(ti.vgpr("MeanA"), ti.vgpr("MeanA"), ti.vgpr("Tmp+1")))
@@ -582,10 +586,12 @@ class LayerNormKernelGenerator:
         mod.addComment0("get_average")
         mod.add(ti.VCvtI32toF32(ti.vgpr("Tmp"), ti.sgpr("SizeLength")))
         mod.add(ti.VRcpF32(ti.vgpr("Tmp"),ti.vgpr("Tmp")))
+        mod.add(ti.SNop(waitState=0, comment="1 wait states"))
         mod.add(ti.VMulF32(ti.vgpr("Invvar"), ti.vgpr("Tmp"), ti.vgpr("Invvar")))
 
         mod.add(ti.VAddF32(ti.vgpr("Invvar"), ti.vgpr("Invvar"), ti.sgpr("Eps")))
-        mod.add(ti.TextBlock("v_rsq_f32 v[vgprInvvar], v[vgprInvvar]\n"))
+        mod.add(ti.VRsqF32(ti.vgpr("Invvar"), ti.vgpr("Invvar")))
+        mod.add(ti.SNop(waitState=0, comment="1 wait states"))
         mod.addSpaceLine()
         return mod
 
@@ -832,19 +838,6 @@ class LayerNormKernelGenerator:
             mod.add(self.output_mean_and_invvar())
         return mod
 
-def kernel_rodata(name: str):
-    return f'''
-.rodata
-.p2align 6
-.amdhsa_kernel {name}
-.amdhsa_user_sgpr_kernarg_segment_ptr 1
-.amdhsa_system_sgpr_workgroup_id_x 1
-.amdhsa_accum_offset 8
-.amdhsa_next_free_vgpr .amdgcn.next_free_vgpr
-.amdhsa_next_free_sgpr .amdgcn.next_free_sgpr
-.end_amdhsa_kernel
-'''
-
 @dataclass
 class KernelArgument:
     size: int
@@ -910,10 +903,8 @@ def meta_str(kernels: Tuple[KernelMeta]):
 if __name__ == '__main__':
     ap = ArgumentParser()
     ap.add_argument('-o', '--output', type=str, required=True, help='Output path of compiled binary')
-    ap.add_argument('-m', type=int, default=16, help='Dimension 0 of tile')
-    ap.add_argument('-n', type=int, default=16, help='Dimension 1 of tile')
-    ap.add_argument('-c', type=int, default=4, help='load conut per iteration')
     ap.add_argument('-w', type=int, default=256, help='workitem')
+    ap.add_argument('-c', type=int, default=4, help='load conut per iteration')
     ap.add_argument('--sweep-once', type=int, default=0, dest='sweep_once', help='sweep once')
     ap.add_argument('--toolchain', type=str, default='/opt/rocm/llvm/bin/clang++', help='Path to ROCm compiler')
     ap.add_argument('--debug-build', action='store_true', dest='debug_build', help='Build with debug information')
@@ -921,10 +912,8 @@ if __name__ == '__main__':
     ap.add_argument('--arch', type=str, default='gfx90a', help='Target architecture for assembler, e.g. gfx908. Default is gfx90a')
     args = ap.parse_args()
     output_path: str = args.output
-    m: int = args.m
-    n: int = args.n
-    c: int = args.c
     w: int = args.w
+    c: int = args.c
     sweep_once:int = args.sweep_once
     toolchain_path: str = args.toolchain
     debug_build: bool = args.debug_build
@@ -940,7 +929,7 @@ if __name__ == '__main__':
         toolchain_path = globalParameters['AssemblerPath']
 
     ti.Base._global_ti.init(isa, toolchain_path, False)
-    layernorm = LayerNormKernelGenerator(ti.DataType('S'), n, m, w, c, 4, sweep_once, arch)
+    layernorm = LayerNormKernelGenerator(ti.DataType('S'), w, c, 4, sweep_once, arch)
     kernel_body = layernorm.layernorm_kernel_body()
     args = layernorm.kernel_args()
     func_name = layernorm.func_name
@@ -963,3 +952,4 @@ if __name__ == '__main__':
     ret = subprocess.run([toolchain_path] + build_args)
     ret = subprocess.run([toolchain_path, '-target', 'amdcgn-amdhsa', '-o', f'{output_path_basename}.co', f'{output_path_basename}.o'])
     layernorm.dump('yaml', f'{output_path_basename}.yaml')
+

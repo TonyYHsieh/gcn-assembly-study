@@ -40,31 +40,32 @@ def kernel_header(name: str, gfx_arch: str, vgpr: int, sgpr: int, lds: int):
     sgpr = ((sgpr+7)//8)*8
     lds  = ((lds+31)//32)*32
 
-    return f'''
-.amdgcn_target "amdgcn-amd-amdhsa--{gfx_arch}"
-.text
-.protected {name}
-.globl {name}
-.p2align 8
-.type {name},@function
-.section .rodata,#alloc
-.p2align 6
-.amdhsa_kernel {name}
-  .amdhsa_user_sgpr_kernarg_segment_ptr 1
-  .amdhsa_accum_offset {vgpr} // accvgpr offset
-  .amdhsa_next_free_vgpr {vgpr} // vgprs
-  .amdhsa_next_free_sgpr {sgpr} // sgprs
-  .amdhsa_group_segment_fixed_size {lds} // lds bytes
-  .amdhsa_private_segment_fixed_size 0
-  .amdhsa_system_sgpr_workgroup_id_x 1
-  .amdhsa_system_sgpr_workgroup_id_y 1
-  .amdhsa_system_sgpr_workgroup_id_z 1
-  .amdhsa_system_vgpr_workitem_id 0
-  .amdhsa_float_denorm_mode_32 3
-  .amdhsa_float_denorm_mode_16_64 3
-.end_amdhsa_kernel
-.text
-'''
+    header = ""
+    header += f'.amdgcn_target "amdgcn-amd-amdhsa--{gfx_arch}"\n'
+    header += f'.text\n'
+    header += f'.protected {name}\n'
+    header += f'.globl {name}\n'
+    header += f'.p2align 8\n'
+    header += f'.type {name},@function\n'
+    header += f'.section .rodata,#alloc\n'
+    header += f'.p2align 6\n'
+    header += f'.amdhsa_kernel {name}\n'
+    header += f'  .amdhsa_user_sgpr_kernarg_segment_ptr 1\n'
+    if (gfx_arch not in ("gfx900", "gfx908", "gfx1030", "gfx1100", "gfx1101", "gfx1102")):
+        header += f'  .amdhsa_accum_offset {vgpr} // accvgpr offset\n'
+    header += f'  .amdhsa_next_free_vgpr {vgpr} // vgprs\n'
+    header += f'  .amdhsa_next_free_sgpr {sgpr} // sgprs\n'
+    header += f'  .amdhsa_group_segment_fixed_size {lds} // lds bytes\n'
+    header += f'  .amdhsa_private_segment_fixed_size 0\n'
+    header += f'  .amdhsa_system_sgpr_workgroup_id_x 1\n'
+    header += f'  .amdhsa_system_sgpr_workgroup_id_y 1\n'
+    header += f'  .amdhsa_system_sgpr_workgroup_id_z 1\n'
+    header += f'  .amdhsa_system_vgpr_workitem_id 0\n'
+    header += f'  .amdhsa_float_denorm_mode_32 3\n'
+    header += f'  .amdhsa_float_denorm_mode_16_64 3\n'
+    header += f'.end_amdhsa_kernel\n'
+    header += f'.text\n'
+    return header
 
 @contextmanager
 def asm_func(func_name: str, module: ti.Module):

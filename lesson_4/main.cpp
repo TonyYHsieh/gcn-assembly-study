@@ -14,17 +14,32 @@
 #include "../Utils/BufferUtils.hpp"
 
 
+template<typename T>
+T abs(T a)
+{
+    return (a > T(0)) ? a : -a;
+}
+
+
+template<typename T>
+T max(T a, T b)
+{
+    return (a > b) ? a : b;
+}
+
+
 template<typename DType>
 void cpuAMax(DType *out, DType *in, std::uint32_t length)
 {
     // calculate amax
     out[0] = 0;
     for(int j=0; j<length; j++) {
-        out[0] = std::max(out[0], std::abs(in[j]));
+        out[0] = max(out[0], abs(in[j]));
     }
 }
 
-hipError_t launchASMAMax(hipFunction_t func, float *out, float* in, std::uint32_t length, std::size_t numRuns) {
+template<typename T>
+hipError_t launchASMAMax(hipFunction_t func, T *out, T* in, std::uint32_t length, std::size_t numRuns) {
 
     KernelArguments args;
     args.append(out);
@@ -56,7 +71,6 @@ hipError_t launchASMAMax(hipFunction_t func, float *out, float* in, std::uint32_
     float dur{};
     err = hipEventElapsedTime(&dur, beg, end);
     std::cout << "ASM kernel time: " << std::to_string(dur / numRuns) << " ms\n";
-//    std::cout << "Perf: " << numRuns * m * n * 2 * sizeof(float) * 1e3 / std::pow(1024.f, 3) / dur << " GB/s\n";
     return err;
 }
 
@@ -76,31 +90,27 @@ void dumpBuffer(const char* title, const std::vector<T>& data, int length)
     std::cout << "----- " << title << " -----" << std::endl;
     for(int j=0; j<length; j++)
     {
-        std::cout << data[j] << " ";
-        if (j%64 == 63)
-            std::cout << std::endl;
+        std::cout << float(data[j]) << " ";
     }
     std::cout << std::endl;
 }
 
-int main(int argc, char **argv) {
+template <typename T>
+void AMaxTest(const std::string& coPath, const std::uint32_t& length)
+{
     hipDevice_t dev{};
     auto err = hipDeviceGet(&dev, 0);
-    assert(argc == 3);
 
-    const std::string coPath(argv[1]);
-    const std::uint32_t length(std::atoi(argv[2]));
-
-    std::vector<float> cpuInput(length, 0);
+    std::vector<T> cpuInput(length, 0);
     randomize(begin(cpuInput), end(cpuInput));
 
-    float *gpuInput{};
-    err = hipMalloc(&gpuInput, sizeof(float) * length);
-    err = hipMemcpyHtoD(gpuInput, cpuInput.data(), cpuInput.size() * sizeof(float));
+    T *gpuInput{};
+    err = hipMalloc(&gpuInput, sizeof(T) * length);
+    err = hipMemcpyHtoD(gpuInput, cpuInput.data(), cpuInput.size() * sizeof(T));
 
-    float *gpuOutput{};
-    err = hipMalloc(&gpuOutput, sizeof(float));
-    err = hipMemset(gpuOutput, 0, sizeof(float));
+    T *gpuOutput{};
+    err = hipMalloc(&gpuOutput, sizeof(T));
+    err = hipMemset(gpuOutput, 0, sizeof(T));
 
     hipModule_t module{};
     hipFunction_t func{};
@@ -111,48 +121,36 @@ int main(int argc, char **argv) {
     if (err)
         std::cout << "launchASMAMax error : " << err << std::endl;
 
-    std::vector<float> cpuOutput(1, 0.0f);
-    err = hipMemcpyDtoH(cpuOutput.data(), gpuOutput, sizeof(float));
+    std::vector<T> cpuOutput(1, 0.0f);
+    err = hipMemcpyDtoH(cpuOutput.data(), gpuOutput, sizeof(T));
     dumpBuffer("GPU result", cpuOutput, cpuOutput.size());
 
-    std::vector<float> cpuRef(1, 0.f);
-    cpuAMax<float>(cpuRef.data(), cpuInput.data(), length);
+    std::vector<T> cpuRef(1, 0.f);
+    cpuAMax<T>(cpuRef.data(), cpuInput.data(), length);
     dumpBuffer("CPU result", cpuRef, cpuRef.size());
 
-    float error = 0.0;
-    int gpunan = 0;
-    int cpunan = 0;
-    int gpuinf = 0;
-    int cpuinf = 0;
+    T error = 0.0;
     for (std::size_t i = 0; i < 1; ++i) {
-        error = std::max(error, std::abs(cpuOutput[i]-cpuRef[i]));
-        if (std::isnan(cpuOutput[i])) {
-            gpunan += 1;
-        }
-        if (std::isnan(cpuRef[i])) {
-            cpunan += 1;
-        }
-        if (std::isinf(cpuOutput[i])) {
-            gpuinf += 1;
-        }
-        if (std::isinf(cpuRef[i])) {
-            cpuinf += 1;
-        }
+        error = max(error, abs(cpuOutput[i]-cpuRef[i]));
     }
 
-    std::cout << "----- " << "data result" << " -----" << std::endl;
-    if (gpunan)
-        std::cout << "gpunan: " << gpunan << std::endl;
-    if (cpunan)
-        std::cout << "cpunan: " << cpunan << std::endl;
-    if (gpuinf)
-        std::cout << "gpuinf: " << gpuinf << std::endl;
-    if (cpuinf)
-        std::cout << "cpuinf: " << cpuinf << std::endl;
-    std::cout << "Tony max error : " << error << std::endl;
+    std::cout << "Tony max error : " << float(error) << std::endl;
 
     err = hipFree(gpuOutput);
     err = hipFree(gpuInput);
     err = hipModuleUnload(module);
+}
+
+
+int main(int argc, char **argv) {
+
+    assert(argc == 3);
+
+    const std::string coPath(argv[1]);
+    const std::uint32_t length(std::atoi(argv[2]));
+
+//    AMaxTest<float>(coPath, length);
+    AMaxTest<_Float16>(coPath, length);
+
     return 0;
 }

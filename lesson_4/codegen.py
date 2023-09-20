@@ -151,6 +151,79 @@ class AMaxKernelGenerator:
         with open(output_path, 'w') as f:
             f.write(s)
 
+
+    def local_read_inst_type(self, num_elements: int):
+        if self.io_type.isSingle():
+            insts = {
+                1: ti.DSLoadB32,
+                2: ti.DSLoadB64,
+                4: ti.DSLoadB128
+            }
+        elif self.io_type.isHalf():
+            insts = {
+                1: ti.DSLoadU16,
+                2: ti.DSLoadB32,
+                4: ti.DSLoadB64,
+                8: ti.DSLoadB128
+            }
+        return insts[num_elements]
+
+
+    def local_write_inst_type(self, num_elements: int):
+        if self.io_type.isSingle():
+            insts = {
+                1: ti.DSStoreB32,
+                2: ti.DSStoreB64,
+                4: ti.DSStoreB128
+            }
+        elif self.io_type.isHalf():
+            insts = {
+                1: ti.DSStoreB16,
+                2: ti.DSStoreB32,
+                4: ti.DSStoreB64,
+                8: ti.DSStoreB128
+            }
+        return insts[num_elements]
+
+
+    def global_read_inst_type(self, num_elements: int):
+        if self.io_type.isSingle():
+            insts = {
+                1: ti.BufferLoadB32,
+                2: ti.BufferLoadB64,
+                4: ti.BufferLoadB128
+            }
+        elif self.io_type.isHalf():
+            insts = {
+                1: ti.BufferLoadD16B16,
+                2: ti.BufferLoadB32,
+                4: ti.BufferLoadB64,
+                8: ti.BufferLoadB128
+            }
+        else:
+            raise NotImplementedError
+        return insts[num_elements]
+
+    def global_write_inst_type(self, num_elements: int):
+        if self.io_type.isSingle():
+            insts = {
+                1: ti.BufferStoreB32,
+                2: ti.BufferStoreB64,
+                4: ti.BufferStoreB128
+            }
+        elif self.io_type.isHalf():
+            insts = {
+                1: ti.BufferStoreB16,
+                2: ti.BufferStoreB32,
+                4: ti.BufferStoreB64,
+                8: ti.BufferStoreB128
+            }
+        else:
+            raise NotImplementedError
+        return insts[num_elements]
+
+
+
     def defineSgpr(self, name, numSgprs, align=1):
         if numSgprs == 0: return
         sgprIdx = self.sgpr_pool.checkOutAligned(numSgprs, align, tag=name, preventOverflow=0)
@@ -224,7 +297,7 @@ class AMaxKernelGenerator:
     def init_param(self) -> ti.Module:
         mod = ti.Module("init_param")
         mod.addComment0("init_param")
-        mod.add(ti.SLShiftLeftB32(ti.sgpr("Tmp"), 2, ti.sgpr("SizeLength")))
+        mod.add(ti.SLShiftLeftB32(ti.sgpr("Tmp"), int(log2(self.bpe)), ti.sgpr("SizeLength")))
         mod.addSpaceLine()
 
         mod.add(ti.SMovB32(ti.sgpr("Dst+0"), ti.sgpr("AddressOut+0")))
@@ -239,7 +312,7 @@ class AMaxKernelGenerator:
         mod.add(ti.SMovB32(ti.sgpr("Src+3"), "Srd127_96"))
         mod.addSpaceLine()
 
-        mod.add(ti.VMovB32(ti.vgpr("Output"), 0.0))
+        mod.add(ti.VMovB32(ti.vgpr("Output"), 0))
         mod.addSpaceLine()
         return mod
 
@@ -249,11 +322,10 @@ class AMaxKernelGenerator:
         mod = ti.Module("calculate_global_address")
         mod.addComment0("calculate_global_address")
 
-        mod.add(ti.VLShiftLeftB32(ti.vgpr("Offset+0"), hex(int(log2(self.num_load_size * self.bpe))), ti.vgpr("Serial")))
+        mod.add(ti.VLShiftLeftB32(ti.vgpr("Offset+0"), hex(int(log2(self.num_load_size * 4))), ti.vgpr("Serial")))
         mod.addSpaceLine()
 
-        offset = self.num_workitems * self.num_load_size
-        mod.add(ti.SMovB32(ti.sgpr("Tmp"), self.num_workitems * self.num_load_size * self.bpe))
+        mod.add(ti.SMovB32(ti.sgpr("Tmp"), self.num_workitems * self.num_load_size * 4))
         for i in range(0, self.num_load_count-1):
             mod.add(ti.VAddU32(ti.vgpr(f"Offset+{i+1}"), ti.vgpr(f"Offset+{i}"), ti.sgpr("Tmp")))
         mod.addSpaceLine()
@@ -262,12 +334,17 @@ class AMaxKernelGenerator:
 
     def sum_per_data(self, val) -> ti.Module:
         mod = ti.Module("sum_per_data")
-        mod.add(ti.TextBlock(f'v_max_f32 v[vgprOutput], v[vgprOutput], abs({val})\n'))
+        if (self.io_type.isHalf()):
+            mod.add(ti.TextBlock(f'v_max_f16 v[vgprOutput], v[vgprOutput], abs({val})\n'))
+            mod.add(ti.VLShiftRightB32(val, 16, val))
+            mod.add(ti.TextBlock(f'v_max_f16 v[vgprOutput], v[vgprOutput], abs({val})\n'))
+        elif (self.io_type.isSingle()):
+            mod.add(ti.TextBlock(f'v_max_f32 v[vgprOutput], v[vgprOutput], abs({val})\n'))
         return mod
 
 
     def sum_per_threadxN(self) -> ti.Module:
-        offset = self.num_workitems * self.num_load_count * self.num_load_size
+        offset = self.num_workitems * self.num_load_count * self.num_load_size * (4 // self.bpe)
         mod = ti.Module("sum_per_threadxN")
         mod.addComment0("sum_per_threadxN")
         mod.add(ti.SLShiftRightB32(ti.sgpr("MainLoop"), int(log2(offset)), ti.sgpr("SizeLength")))
@@ -291,7 +368,7 @@ class AMaxKernelGenerator:
 
 
     def sum_per_threadx4(self) -> ti.Module:
-        offset = self.num_workitems * self.num_load_size
+        offset = self.num_workitems * self.num_load_size * (4 // self.bpe)
         mod = ti.Module("sum_per_threadx4")
         mod.addComment0("sum_per_threadx4")
         mod.add(ti.SLShiftRightB32(ti.sgpr("MainLoop"), int(log2(offset)), ti.sgpr("SizeLength")))
@@ -305,7 +382,7 @@ class AMaxKernelGenerator:
             mod.add(self.sum_per_data(ti.vgpr("Value+2")))
             mod.add(self.sum_per_data(ti.vgpr("Value+3")))
             mod.addSpaceLine()
-            mod.add(ti.SMovB32(ti.sgpr("Tmp"), self.num_workitems * self.num_load_size * self.bpe))
+            mod.add(ti.SMovB32(ti.sgpr("Tmp"), offset * self.bpe))
             mod.add(ti.VAddU32(ti.vgpr("Offset"), ti.vgpr("Offset"), ti.sgpr("Tmp")))
             mod.addSpaceLine()
         return mod
@@ -316,6 +393,11 @@ class AMaxKernelGenerator:
         mod.add(ti.VMulLOU32(ti.vgpr("Tmp"), 3, ti.vgpr("Serial")))
         mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 2, ti.vgpr("Tmp")))
         mod.add(ti.VSubU32(ti.vgpr("Offset"), ti.vgpr("Offset"), ti.vgpr("Tmp")))
+
+        if (self.io_type.isHalf()):
+            mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 1, ti.vgpr("Serial")))
+            mod.add(ti.VSubU32(ti.vgpr("Offset"), ti.vgpr("Offset"), ti.vgpr("Tmp")))
+
         mod.addSpaceLine()
         return mod
 
@@ -325,9 +407,10 @@ class AMaxKernelGenerator:
         mod = ti.Module("sum_per_thread")
         mod.addComment0("sum_per_thread")
         mod.add(ti.SLShiftRightB32(ti.sgpr("MainLoop"), int(log2(offset)), ti.sgpr("SizeLength")))
-        mod.add(ti.SAndB32(ti.sgpr("MainLoop"), ti.sgpr("MainLoop"), self.num_load_size-1))
+        mod.add(ti.SAndB32(ti.sgpr("MainLoop"), ti.sgpr("MainLoop"), self.num_load_size * (4 // self.bpe) - 1))
         with asm_loop(mod, "sum_per_thread", "MainLoop"):
-            mod.add(ti.BufferLoadB32(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
+            BufferLoadx1 = self.global_read_inst_type(1)
+            mod.add(BufferLoadx1(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
             mod.add(ti.SWaitCnt(vmcnt=0))
             mod.addSpaceLine()
             mod.add(self.sum_per_data(ti.vgpr("Value")))
@@ -347,7 +430,8 @@ class AMaxKernelGenerator:
         mod.add(ti.SCBranchVCCZ(label_sum_end.getLabelName()))
         mod.add(ti.SMovB64("exec", "vcc"))
         mod.add(ti.SNop(1))
-        mod.add(ti.BufferLoadB32(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
+        BufferLoadx1 = self.global_read_inst_type(1)
+        mod.add(BufferLoadx1(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
         mod.add(ti.SWaitCnt(vmcnt=0))
         mod.addSpaceLine()
         mod.add(self.sum_per_data(ti.vgpr("Value")))
@@ -361,7 +445,11 @@ class AMaxKernelGenerator:
 
     def merge_sum(self) -> ti.Module:
         mod = ti.Module("merge_sum")
-        mod.add(ti.VMaxF32(ti.vgpr("Output"), ti.vgpr("Output"), ti.vgpr("OutputB")))
+        if (self.io_type.isHalf()):
+            mod.add(ti.VMaxF16(ti.vgpr("Output"), ti.vgpr("Output"), ti.vgpr("OutputB")))
+        elif (self.io_type.isSingle()):
+            mod.add(ti.VMaxF32(ti.vgpr("Output"), ti.vgpr("Output"), ti.vgpr("OutputB")))
+
         return mod
 
 
@@ -412,17 +500,19 @@ class AMaxKernelGenerator:
 
         mod.add(label_upper)
         mod.add(ti.VSubU32(ti.vgpr("Tmp"), ti.vgpr("Widx"), ti.sgpr("Offset")))
-        mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 2, ti.vgpr("Tmp")))
+        mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), int(log2(self.bpe)), ti.vgpr("Tmp")))
         ds = ti.DSModifiers(offset=0)
-        mod.add(ti.DSStoreB32(ti.vgpr("Tmp"), ti.vgpr("Output"), ds))
+        DSStorex1 = self.local_write_inst_type(1)
+        mod.add(DSStorex1(ti.vgpr("Tmp"), ti.vgpr("Output"), ds))
         mod.add(ti.SWaitCnt(lgkmcnt=0))
         mod.add(ti.SBarrier())
         mod.add(ti.SBranch(label_inter.getLabelName()))
         mod.add(label_lower)
         mod.add(ti.SBarrier())
-        mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 2, ti.vgpr("Widx")))
+        mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), int(log2(self.bpe)), ti.vgpr("Widx")))
         ds = ti.DSModifiers(offset=0)
-        mod.add(ti.DSLoadB32(ti.vgpr("OutputB"), ti.vgpr("Tmp"), ds))
+        DSLoadx1 = self.local_read_inst_type(1)
+        mod.add(DSLoadx1(ti.vgpr("OutputB"), ti.vgpr("Tmp"), ds))
         mod.add(ti.SWaitCnt(lgkmcnt=0))
         mod.add(self.merge_sum())
         mod.add(ti.SBranch(label_inter.getLabelName()))
@@ -443,7 +533,8 @@ class AMaxKernelGenerator:
         mod.add(ti.VCmpEQU32("vcc", ti.vgpr("Widx"), 0))
         mod.add(ti.SCBranchVCCZ(label_lower.getLabelName()))
         ds = ti.DSModifiers(offset=0)
-        mod.add(ti.DSStoreB32(ti.vgpr("Widx"), ti.vgpr("Output"), ds))
+        DSStorex1 = self.local_write_inst_type(1)
+        mod.add(DSStorex1(ti.vgpr("Widx"), ti.vgpr("Output"), ds))
         mod.add(ti.SWaitCnt(lgkmcnt=0))
         mod.add(ti.SBarrier())
         mod.add(ti.SBranch(label_end.getLabelName()))
@@ -451,7 +542,8 @@ class AMaxKernelGenerator:
         mod.add(ti.SBarrier())
         mod.add(ti.VMovB32(ti.vgpr("Tmp"), 0))
         ds = ti.DSModifiers(offset=0)
-        mod.add(ti.DSLoadB32(ti.vgpr("Output"), ti.vgpr("Tmp"), ds))
+        DSLoadx1 = self.local_read_inst_type(1)
+        mod.add(DSLoadx1(ti.vgpr("Output"), ti.vgpr("Tmp"), ds))
         mod.add(ti.SWaitCnt(lgkmcnt=0))
         mod.add(label_end)
         mod.addSpaceLine()
@@ -464,8 +556,8 @@ class AMaxKernelGenerator:
 
         mod.add(ti.VMovB32(ti.vgpr("Offset"), 0))
         mod.addSpaceLine()
-
-        mod.add(ti.BufferStoreB32(ti.vgpr("Output"), ti.vgpr("Offset"), ti.sgpr("Dst",4), 0, ti.MUBUFModifiers(offen=True)))
+        BufferStorex1 = self.global_write_inst_type(1)
+        mod.add(BufferStorex1(ti.vgpr("Output"), ti.vgpr("Offset"), ti.sgpr("Dst",4), 0, ti.MUBUFModifiers(offen=True)))
         mod.addSpaceLine()
 
         return mod

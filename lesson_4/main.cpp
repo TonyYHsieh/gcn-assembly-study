@@ -144,13 +144,18 @@ void AMaxTest(const std::string& coPath, const std::uint32_t& length)
 
 int main(int argc, char **argv) {
 
-    assert(argc == 3);
+    assert(argc == 4);
 
     const std::string coPath(argv[1]);
-    const std::uint32_t length(std::atoi(argv[2]));
+    const std::string type(argv[2]);
+    const std::uint32_t length(std::atoi(argv[3]));
 
-//    AMaxTest<float>(coPath, length);
-    AMaxTest<_Float16>(coPath, length);
+    if (type == "S")
+        AMaxTest<float>(coPath, length);
+    else if (type == "H")
+        AMaxTest<_Float16>(coPath, length);
+    else
+        std::cout << "unsupported type " << type << std::endl;
 
     return 0;
 }

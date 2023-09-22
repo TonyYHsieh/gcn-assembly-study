@@ -5,7 +5,7 @@
 
 static std::random_device rd;
 static std::mt19937 gen(rd());
-static std::uniform_real_distribution<float> dist(-1.f, 1.f);
+static std::normal_distribution<float> dist(-100.f, 100.f);
 
 template<typename Iter>
 void randomize(Iter beg, Iter end) {

@@ -128,7 +128,7 @@ class AMaxKernelGenerator:
 
     @property
     def func_name(self):
-        return "AMax"
+        return 'AMax'
 
     def dumps(self, format: str) -> str:
         param_dict = {
@@ -335,11 +335,11 @@ class AMaxKernelGenerator:
     def sum_per_data(self, val) -> ti.Module:
         mod = ti.Module("sum_per_data")
         if (self.io_type.isHalf()):
-            mod.add(ti.TextBlock(f'v_max_f16 v[vgprOutput], v[vgprOutput], abs({val})\n'))
+            mod.add(ti.VMaxF16(ti.vgpr("Output"), ti.vgpr("Output"), ti.SrcAbs(val)))
             mod.add(ti.VLShiftRightB32(val, 16, val))
-            mod.add(ti.TextBlock(f'v_max_f16 v[vgprOutput], v[vgprOutput], abs({val})\n'))
+            mod.add(ti.VMaxF16(ti.vgpr("Output"), ti.vgpr("Output"), ti.SrcAbs(val)))
         elif (self.io_type.isSingle()):
-            mod.add(ti.TextBlock(f'v_max_f32 v[vgprOutput], v[vgprOutput], abs({val})\n'))
+            mod.add(ti.VMaxF32(ti.vgpr("Output"), ti.vgpr("Output"), ti.SrcAbs(val)))
         return mod
 
 

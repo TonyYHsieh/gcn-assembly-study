@@ -104,27 +104,34 @@ class AMaxKernelGenerator:
                  num_workitems: int,
                  num_load_count: int,
                  num_load_size: int,
-                 arch: str):
+                 arch: str,
+                 wave_size: int):
         self.io_type = io_type
-        self.bpe = io_type.numBytes()
         self.num_workitems = num_workitems
         self.num_load_count = num_load_count
         self.num_load_size = num_load_size
+        self.arch = arch
+        self.wave_size = wave_size
+
+        self.op = 'AMax'
+        self.bpe = io_type.numBytes()
         self.sgpr_pool = ti.RegisterPool(24, 's', True)
         self.vgpr_pool = ti.RegisterPool(40, 'v', True)
         self.sgpr_pool.add(0, 23) #TODO: estimate this
         self.vgpr_pool.add(0, 39) #TODO: estimate this
-        self.debug_label = True
-        self.arch = arch
-        self.op = 'AMax'
         self.sgprs  = collections.OrderedDict()
         self.vgprs  = collections.OrderedDict()
+
+        self.vcc = "vcc" if (wave_size == 64) else "vcc_lo"
+        self.exec = "exec" if (wave_size == 64) else "exec_lo"
+        self.num_mask = 2 if (wave_size == 64) else 1
+        self.debug_label = True
 
     @property
     def lds_usage_byte(self) -> int:
         # used in reduce inter wave mean and invvar
         # 4 data * half_wave_num * bpe
-        return 4 * (self.num_workitems // 64 // 2) * self.bpe
+        return 1 * (self.num_workitems // self.wave_size // 2) * self.bpe
 
     @property
     def func_name(self):
@@ -426,9 +433,12 @@ class AMaxKernelGenerator:
         mod = ti.Module("sum_in_some_thread")
         mod.addComment0("sum_in_some_thread")
         mod.add(ti.SAndB32(ti.sgpr("MainLoop"), ti.sgpr("SizeLength"), self.num_workitems-1))
-        mod.add(ti.VCmpLtU32("vcc", ti.vgpr("Serial"), ti.sgpr("MainLoop")))
+        mod.add(ti.VCmpLtU32(self.vcc, ti.vgpr("Serial"), ti.sgpr("MainLoop")))
         mod.add(ti.SCBranchVCCZ(label_sum_end.getLabelName()))
-        mod.add(ti.SMovB64("exec", "vcc"))
+        if self.wave_size == 64:
+            mod.add(ti.SMovB64(self.exec, self.vcc))
+        else:
+            mod.add(ti.SMovB32(self.exec, self.vcc))
         mod.add(ti.SNop(1))
         BufferLoadx1 = self.global_read_inst_type(1)
         mod.add(BufferLoadx1(ti.vgpr("Value"), ti.vgpr("Offset"), ti.sgpr("Src",4), 0, ti.MUBUFModifiers(offen=True)))
@@ -436,7 +446,10 @@ class AMaxKernelGenerator:
         mod.addSpaceLine()
         mod.add(self.sum_per_data(ti.vgpr("Value")))
         mod.addSpaceLine()
-        mod.add(ti.SMovB64("exec", "-1"))
+        if self.wave_size == 64:
+            mod.add(ti.SMovB64(self.exec, "-1"))
+        else:
+            mod.add(ti.SMovB32(self.exec, "-1"))
         mod.add(ti.SNop(1))
         mod.add(label_sum_end)
         mod.addSpaceLine()
@@ -461,7 +474,7 @@ class AMaxKernelGenerator:
         mod.add(label)
         mod.addSpaceLine()
         mod.add(ti.VAddU32(ti.vgpr("Tmp"), ti.sgpr("Tmp"), ti.vgpr("Serial")))
-        mod.add(ti.VAndB32(ti.vgpr("Tmp"), 63, ti.vgpr("Tmp")))
+        mod.add(ti.VAndB32(ti.vgpr("Tmp"), (self.wave_size - 1), ti.vgpr("Tmp")))
         mod.add(ti.VLShiftLeftB32(ti.vgpr("Tmp"), 0x2, ti.vgpr("Tmp")))
         mod.addSpaceLine()
         mod.add(ti.DSBPermuteB32(ti.vgpr("OutputB"), ti.vgpr("Tmp"), ti.vgpr("Output")))
@@ -469,7 +482,7 @@ class AMaxKernelGenerator:
         mod.addSpaceLine()
         mod.add(self.merge_sum())
         mod.add(ti.SLShiftLeftB32(ti.sgpr("Tmp"), 1, ti.sgpr("Tmp")))
-        mod.add(ti.SCmpLtU32(ti.sgpr("Tmp"), 64))
+        mod.add(ti.SCmpLtU32(ti.sgpr("Tmp"), self.wave_size))
         mod.add(ti.SCBranchSCC1(label.getLabelName()))
         mod.addSpaceLine()
         return mod
@@ -483,18 +496,21 @@ class AMaxKernelGenerator:
         label_end   = ti.Label("end", f'end')
         mod = ti.Module("inter_wave_reduction")
         mod.addComment0("inter_wave_reduction")
-        mod.add(ti.VLShiftRightB32(ti.vgpr("Widx"), 6, ti.vgpr("Serial")))
-        mod.add(ti.SMovB32(ti.sgpr("Offset"), self.num_workitems // 64))
+        mod.add(ti.VLShiftRightB32(ti.vgpr("Widx"), int(log2(self.wave_size)), ti.vgpr("Serial")))
+        mod.add(ti.SMovB32(ti.sgpr("Offset"), self.num_workitems // self.wave_size))
         mod.add(label_inter)
         mod.add(ti.SLShiftRightB32(ti.sgpr("Offset"), 1, ti.sgpr("Offset")))
         mod.add(ti.SCmpEQU32(ti.sgpr("Offset"), 0))
         mod.add(ti.SCBranchSCC1(label_end.getLabelName()))
         mod.add(ti.SLShiftLeftB32(ti.sgpr("Tmp"), 1, ti.sgpr("Offset")))
-        mod.add(ti.VCmpLtU32(ti.sgpr("Tmp+2",2), ti.vgpr("Widx"), ti.sgpr("Tmp")))
-        mod.add(ti.VCmpGEU32(ti.sgpr("Tmp+4",2), ti.vgpr("Widx"), ti.sgpr("Offset")))
-        mod.add(ti.SAndB64("vcc", ti.sgpr("Tmp+2",2), ti.sgpr("Tmp+4",2)))
+        mod.add(ti.VCmpLtU32(ti.sgpr(f"Tmp+{self.num_mask}",self.num_mask), ti.vgpr("Widx"), ti.sgpr("Tmp")))
+        mod.add(ti.VCmpGEU32(ti.sgpr(f"Tmp+{self.num_mask*2}",self.num_mask), ti.vgpr("Widx"), ti.sgpr("Offset")))
+        if self.wave_size == 64:
+            mod.add(ti.SAndB64(self.vcc, ti.sgpr(f"Tmp+{self.num_mask}",self.num_mask), ti.sgpr(f"Tmp+{self.num_mask*2}",self.num_mask)))
+        else:
+            mod.add(ti.SAndB32(self.vcc, ti.sgpr(f"Tmp+{self.num_mask}",self.num_mask), ti.sgpr(f"Tmp+{self.num_mask*2}",self.num_mask)))
         mod.add(ti.SCBranchVCCNZ(label_upper.getLabelName()))
-        mod.add(ti.VCmpLtU32("vcc", ti.vgpr("Widx"), ti.sgpr("Offset")))
+        mod.add(ti.VCmpLtU32(self.vcc, ti.vgpr("Widx"), ti.sgpr("Offset")))
         mod.add(ti.SCBranchVCCNZ(label_lower.getLabelName()))
         mod.add(ti.SBranch(label_empty.getLabelName()))
 
@@ -530,7 +546,7 @@ class AMaxKernelGenerator:
 
         mod = ti.Module("broadcast")
         mod.addComment0("broadcast")
-        mod.add(ti.VCmpEQU32("vcc", ti.vgpr("Widx"), 0))
+        mod.add(ti.VCmpEQU32(self.vcc, ti.vgpr("Widx"), 0))
         mod.add(ti.SCBranchVCCZ(label_lower.getLabelName()))
         ds = ti.DSModifiers(offset=0)
         DSStorex1 = self.local_write_inst_type(1)
@@ -662,6 +678,7 @@ if __name__ == '__main__':
     debug_build: bool = args.debug_build
     arch: str = args.arch
     isa = gfxArch(arch)
+    wave_size : int = 32 if (arch in ("gfx1100", "gfx1101")) else 64
 
     if any([not i for i in (arch, toolchain_path, isa)]):
         restoreDefaultGlobalParameters()
@@ -672,11 +689,12 @@ if __name__ == '__main__':
         toolchain_path = globalParameters['AssemblerPath']
 
     ti.Base._global_ti.init(isa, toolchain_path, False)
-    amax = AMaxKernelGenerator(ti.DataType(t), w, c, 4, arch)
+    amax = AMaxKernelGenerator(ti.DataType(t), w, c, 4, arch, wave_size)
     kernel_body = amax.amax_kernel_body()
     args = amax.kernel_args()
     func_name = amax.func_name
-    meta = KernelMeta(func_name, amax.vgpr_pool.size(), amax.sgpr_pool.size(), 0, amax.lds_usage_byte, 64, w, 8, args)
+    meta = KernelMeta(func_name, amax.vgpr_pool.size(), amax.sgpr_pool.size(), 0, amax.lds_usage_byte, wave_size, w, 8, args)
+
     meta.update_args_offsets()
     k_str = '\n'.join([kernel_header(func_name, arch, amax.vgpr_pool.size(), amax.sgpr_pool.size(), amax.lds_usage_byte),
                        meta_str((meta,)),
@@ -687,11 +705,15 @@ if __name__ == '__main__':
 
     output_path_basename = os.path.splitext(output_path)[0]
 
-    if debug_build:
-        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}', '-mwavefrontsize64', '-c', '-g', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
-    else:
-        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}', '-mwavefrontsize64', '-c', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
+    wave_option = '-mno-wavefrontsize64' if (wave_size == 32) else '-mwavefrontsize64'
 
+    if debug_build:
+        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}', wave_option, '-c', '-g', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
+    else:
+        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}', wave_option, '-c', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
+
+    print([toolchain_path] + build_args)
+    print([toolchain_path, '-target', 'amdcgn-amdhsa', '-o', f'{output_path_basename}.co', f'{output_path_basename}.o'])
     ret = subprocess.run([toolchain_path] + build_args)
     ret = subprocess.run([toolchain_path, '-target', 'amdcgn-amdhsa', '-o', f'{output_path_basename}.co', f'{output_path_basename}.o'])
     amax.dump('yaml', f'{output_path_basename}.yaml')
